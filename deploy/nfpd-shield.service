@@ -1,0 +1,86 @@
+# NFPD Shield systemd unit.
+#
+# Install:
+#   sudo install -m 0644 deploy/nfpd-shield.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nfpd-shield
+#
+# The environment file holds the bot token and database password. It MUST be
+# 0600 and owned by root (systemd reads it as root before dropping privileges):
+#   sudo install -d -m 0750 -o root -g nfpdshield /etc/nfpd-shield
+#   sudo install -m 0600 -o root -g root /dev/null /etc/nfpd-shield/shield.env
+#
+# NOTE: an EnvironmentFile is NOT a shell script. No `export`, no $VAR
+# expansion, no command substitution, no inline comments. One KEY=VALUE per
+# line, values unquoted and plain.
+
+[Unit]
+Description=NFPD Shield - Discord anti-raid and anti-nuke protection
+Documentation=https://github.com/montygulzar/NFPD-Shield
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nfpdshield
+Group=nfpdshield
+WorkingDirectory=/opt/nfpd-shield
+
+EnvironmentFile=/etc/nfpd-shield/shield.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+ExecStart=/opt/nfpd-shield/.venv/bin/python -m shield
+
+# Graceful shutdown: SIGTERM is handled, the gateway is closed and the
+# connection pool is disposed before exit.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=10
+# Give up only if it crash-loops: 5 restarts inside 5 minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logs go to the journal as structured JSON (one object per line).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nfpd-shield
+
+# ---- Hardening (least privilege) ----
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# Shield writes nothing outside these paths. Uncomment ReadWritePaths only if
+# LOG_FILE is set; the default (journal-only) needs no writable directory.
+#ReadWritePaths=/var/log/nfpd-shield
+
+# Resource guards: a runaway process should be killed, not take the host down.
+MemoryMax=512M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

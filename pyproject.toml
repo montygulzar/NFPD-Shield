@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nfpd-shield"
+version = "1.0.0"
+description = "NFPD Shield - multi-guild Discord anti-raid and anti-nuke protection system"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "discord.py>=2.4,<3",
+    "SQLAlchemy[asyncio]>=2.0,<3",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "aiosqlite>=0.20",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+nfpd-shield = "shield.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["shield*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+# An explicit, stable rule set so `ruff check` means the same thing across
+# ruff releases.
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    # `datetime.timezone.utc` is kept spelled out: it reads unambiguously next
+    # to the many naive/aware conversions in the persistence layer.
+    "UP017",
+    # Function calls in argument defaults are used deliberately for dataclass
+    # field factories.
+    "B008",
+    # `str, Enum` is kept over `StrEnum`: the mixin is what SQLAlchemy's
+    # `values_callable` and the slash-command choice values rely on, and it
+    # keeps `repr()` informative in logs.
+    "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately use broad `pytest.raises` for retry-path assertions and
+# long parametrised tables.
+"tests/*" = ["E501"]
+# Alembic revisions are generated; their column definitions are one long line
+# each by construction and are not hand-maintained for width.
+"migrations/versions/*" = ["E501"]
