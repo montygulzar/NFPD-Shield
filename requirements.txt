@@ -4,3 +4,8 @@ SQLAlchemy[asyncio]>=2.0,<3
 asyncpg>=0.29
 alembic>=1.13
 cryptography>=42
+
+# Used directly by shield/health.py for the /health and /ready endpoints. It
+# arrives as a discord.py dependency too, but a module that imports it must
+# declare it rather than rely on that staying true.
+aiohttp>=3.9,<4

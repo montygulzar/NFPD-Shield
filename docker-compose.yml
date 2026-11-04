@@ -1,0 +1,68 @@
+# NFPD Shield - anti-raid / anti-nuke protection.
+#
+# PostgreSQL is NOT defined here: it runs as the pre-existing `nfpd-postgres`
+# container alongside the other NFPD services. This file only builds and runs
+# Shield and joins it to the same network, so `docker compose up` can never
+# touch the database container or its volume.
+#
+# Shield uses its OWN database on that server (default `nfpd_shield`), not the
+# mod bot's. Both projects define a `guild_settings` table with different
+# columns, so sharing one database would break both. See docs/DOCKER.md.
+
+services:
+  shield:
+    build:
+      context: .
+      args:
+        # Stamped into the image so /health and /shield health report the
+        # running build. Override at build time, e.g.
+        #   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
+        APP_VERSION: ${APP_VERSION:-1.0.0}
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    image: nfpd-shield:latest
+    container_name: nfpd-shield
+    restart: unless-stopped
+
+    # All secrets and configuration come from .env - nothing is baked into the
+    # image, and .env is excluded from the build context by .dockerignore.
+    env_file:
+      - .env
+
+    networks:
+      - nodey-monitoring
+
+    # Must exceed the internal shutdown timeouts (gateway close + pool dispose)
+    # so cleanup finishes before Docker escalates to SIGKILL.
+    stop_grace_period: 45s
+
+    # Without limits the daemon's json-file logs grow until the host disk fills.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # Modest ceilings so a runaway process cannot starve the rest of the host.
+    # Override in .env with DOCKER_MEMORY_LIMIT (e.g. 256M, 1G).
+    deploy:
+      resources:
+        limits:
+          memory: ${DOCKER_MEMORY_LIMIT:-512M}
+
+    security_opt:
+      - no-new-privileges:true
+
+    # Shield writes nothing to disk; logs go to stdout for the Docker daemon.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+      - /home/shield:size=4m
+
+    cap_drop:
+      - ALL
+
+networks:
+  # Created outside this file and shared with nfpd-postgres. `external: true`
+  # means compose attaches to it and never creates or removes it.
+  nodey-monitoring:
+    external: true
