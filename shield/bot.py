@@ -21,6 +21,7 @@ from shield.enforcement.ratelimit import RateLimiter
 from shield.enforcement.selfguard import SelfActionGuard
 from shield.events.notifier import Notifier
 from shield.events.pipeline import EventPipeline
+from shield.health import HealthServer
 from shield.observability.logging import get_logger
 from shield.observability.metrics import METRICS
 from shield.policies.engine import PolicyEngine
@@ -119,12 +120,19 @@ class ShieldBot(commands.Bot):
         self.snapshot_scheduler = SnapshotScheduler(
             bot=self, service=self.snapshots, db=self.db
         )
+        self.health = HealthServer(self)
         self._maintenance_task: asyncio.Task | None = None
         self._bootstrapped = False
 
     # -- lifecycle -----------------------------------------------------
     async def setup_hook(self) -> None:
         log.info("shield starting", extra={"config": self.shield_config.redacted()})
+
+        # Started first so /health answers probes immediately and /ready reports
+        # 503 while PostgreSQL or the gateway is still coming up. A container
+        # that cannot reach the database must be observably unhealthy, not
+        # silently unreachable.
+        await self.health.start()
 
         ok, error = await self.db.ping()
         if not ok:
@@ -190,6 +198,7 @@ class ShieldBot(commands.Bot):
         log.info("database migrations applied")
 
     async def on_ready(self) -> None:
+        self.health.note_connected()
         self.selfguard.bind_bot(getattr(self.user, "id", None))
         METRICS.gauge("guilds", len(self.guilds))
         log.info(
@@ -203,6 +212,16 @@ class ShieldBot(commands.Bot):
         if not self._bootstrapped:
             self._bootstrapped = True
             await self._bootstrap_guilds()
+
+    async def on_resumed(self) -> None:
+        self.health.note_connected()
+        log.info("gateway session resumed")
+
+    async def on_disconnect(self) -> None:
+        # Fires on every brief gateway drop; discord.py reconnects by itself, so
+        # readiness tolerates this for DISCORD_GRACE_SECONDS before reporting 503.
+        self.health.note_disconnected()
+        log.debug("disconnected from the gateway")
 
     async def _bootstrap_guilds(self) -> None:
         """Ensure a row per guild, take startup snapshots, rehydrate windows."""
@@ -276,6 +295,10 @@ class ShieldBot(commands.Bot):
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         await self.snapshot_scheduler.stop()
+        try:
+            await self.health.stop()
+        except Exception:  # noqa: BLE001 - shutdown must never raise
+            log.warning("error stopping the health server", exc_info=True)
         await super().close()
         await self.db.dispose()
 

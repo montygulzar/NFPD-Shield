@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from shield.constants import SNOWFLAKE_MAX, SNOWFLAKE_MIN, ShieldMode
+from shield.db.urls import ASYNC_PG_SCHEMES, build_url, to_async_url
 
 Env = Mapping[str, str]
 
@@ -30,8 +31,13 @@ FALSE_VALUES = {"0", "false", "no", "off", "n", "f"}
 
 #: Accepted SQLAlchemy URL schemes. A sync driver is rejected because the whole
 #: data layer is async.
-_ASYNC_PG_SCHEMES = {"postgresql+asyncpg", "postgres+asyncpg"}
+_ASYNC_PG_SCHEMES = set(ASYNC_PG_SCHEMES)
 _TEST_SCHEMES = {"sqlite+aiosqlite"}
+
+#: Hosts that are reachable without crossing a network boundary, so TLS adds
+#: nothing. A single-label hostname is a container/service name on a private
+#: Docker network (``nfpd-postgres``), not a routable internet host.
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 _SECRET_KEYS = {
     "DISCORD_TOKEN",
@@ -287,6 +293,15 @@ class ShieldConfig:
     enforce_burst: int
     enforce_refill_seconds: float
 
+    #: Stamped in at image build time so a running container can report exactly
+    #: which build it is.
+    app_version: str
+    git_commit: str
+
+    health_server_enabled: bool
+    health_host: str
+    health_port: int
+
     instance_id: str
     shard_count: int | None
     shard_ids: tuple[int, ...]
@@ -329,6 +344,11 @@ class ShieldConfig:
             "snapshot_include_webhooks": self.snapshot_include_webhooks,
             "audit_correlation_delay": self.audit_correlation_delay,
             "audit_correlation_window": self.audit_correlation_window,
+            "app_version": self.app_version,
+            "git_commit": self.git_commit,
+            "health_server_enabled": self.health_server_enabled,
+            "health_host": self.health_host,
+            "health_port": self.health_port,
             "instance_id": self.instance_id,
             "shard_count": self.shard_count,
             "shard_ids": list(self.shard_ids),
@@ -371,11 +391,42 @@ def load_dotenv(path: str | Path = ".env", env: dict[str, str] | None = None) ->
     return target
 
 
+def _assemble_database_url(col: _Collector) -> str:
+    """``DATABASE_URL`` if set, otherwise built from discrete ``POSTGRES_*`` values.
+
+    The discrete form exists so a compose file can reuse the same credentials it
+    already passes to the PostgreSQL container instead of repeating them inside a
+    second URL. Credentials are percent-encoded: an unescaped ``@`` or ``/`` in a
+    password silently produces a URL pointing somewhere else entirely.
+    """
+    explicit, _ = col.raw("DATABASE_URL")
+    if explicit:
+        return explicit
+
+    user, _ = col.raw("POSTGRES_USER")
+    password, _ = col.raw("POSTGRES_PASSWORD")
+    host, _ = col.raw("POSTGRES_HOST")
+    database, _ = col.raw("POSTGRES_DB")
+    port, _ = col.raw("POSTGRES_PORT")
+    port = port or "5432"
+    if not (user and password and host and database):
+        return ""
+    if not port.isdigit() or not (1 <= int(port) <= 65535):
+        col.fail(f"POSTGRES_PORT={port!r} is not a valid TCP port.")
+        port = "5432"
+    return build_url(user=user, password=password, host=host, database=database, port=port)
+
+
 def _validate_database(col: _Collector) -> DatabaseConfig:
-    url = col.required_str(
-        "DATABASE_URL",
-        hint="Expected postgresql+asyncpg://user:password@host:5432/dbname",
-    )
+    url = _assemble_database_url(col)
+    if not url:
+        col.fail(
+            "Database connection details are required. Set DATABASE_URL "
+            "(postgresql://user:password@host:5432/dbname), or set POSTGRES_USER, "
+            "POSTGRES_PASSWORD, POSTGRES_HOST and POSTGRES_DB and let the URL be "
+            "assembled from them."
+        )
+    url = to_async_url(url)
     requires_tls = False
     tls_configured = False
     if url:
@@ -396,13 +447,14 @@ def _validate_database(col: _Collector) -> DatabaseConfig:
             if scheme.startswith("postgres"):
                 col.fail(
                     f"DATABASE_URL uses the synchronous driver {scheme!r}. "
-                    "NFPD Shield requires an async driver: use "
+                    "NFPD Shield's data layer is async throughout: use "
+                    "postgresql://... (upgraded automatically) or "
                     "postgresql+asyncpg://..."
                 )
             else:
                 col.fail(
                     f"DATABASE_URL scheme {scheme!r} is unsupported. Use "
-                    "postgresql+asyncpg://user:password@host:port/dbname"
+                    "postgresql://user:password@host:port/dbname"
                 )
         elif not parsed.hostname:
             col.fail("DATABASE_URL is missing a host component.")
@@ -410,14 +462,14 @@ def _validate_database(col: _Collector) -> DatabaseConfig:
             col.fail("DATABASE_URL is missing the database name (the /dbname part).")
         else:
             host = parsed.hostname
-            local = host in {"localhost", "127.0.0.1", "::1"} or host.startswith("/")
-            requires_tls = not local
             query = (parsed.query or "").lower()
             tls_configured = "ssl=" in query or "sslmode=" in query
+            requires_tls = _tls_expected(col, host)
             if requires_tls and not tls_configured:
                 col.fail(
                     f"DATABASE_URL points at the remote host {host!r} without TLS. "
-                    "Append ?ssl=require (asyncpg) or set the host to localhost."
+                    "Append ?ssl=require (asyncpg spelling), or set "
+                    "DB_REQUIRE_TLS=false if that hop really is private."
                 )
     return DatabaseConfig(
         url=url,
@@ -428,6 +480,26 @@ def _validate_database(col: _Collector) -> DatabaseConfig:
         requires_tls=requires_tls,
         tls_configured=tls_configured,
     )
+
+
+def _tls_expected(col: _Collector, host: str) -> bool:
+    """Decide whether this hop must be encrypted.
+
+    ``DB_REQUIRE_TLS`` is honoured first when set explicitly, because only the
+    operator knows their network. Otherwise TLS is required for any host that
+    looks routable, and not required for a loopback address, a Unix socket path
+    or a single-label hostname. That last case is the common container
+    deployment: ``nfpd-postgres`` is a Docker DNS name on a private bridge
+    network, so demanding TLS there would reject a correct configuration.
+    """
+    explicit, _ = col.raw("DB_REQUIRE_TLS")
+    if explicit is not None:
+        return col.boolean("DB_REQUIRE_TLS", True)
+    if host in _LOCAL_HOSTS or host.startswith("/"):
+        return False
+    if "." not in host and ":" not in host:
+        return False  # single-label name: a container or LAN hostname
+    return True
 
 
 def _validate_logging(col: _Collector) -> LoggingConfig:
@@ -621,6 +693,11 @@ def load_config(env: Env | None = None, *, allow_dotenv: bool | None = None) -> 
         notify_refill_seconds=col.number("NOTIFY_REFILL_SECONDS", 30.0, minimum=0.5),
         enforce_burst=col.integer("ENFORCE_BURST", 5, minimum=1, maximum=100),
         enforce_refill_seconds=col.number("ENFORCE_REFILL_SECONDS", 20.0, minimum=0.5),
+        app_version=col.optional_str("APP_VERSION", default="dev"),
+        git_commit=col.optional_str("GIT_COMMIT", default="unknown"),
+        health_server_enabled=col.boolean("HEALTH_SERVER_ENABLED", True),
+        health_host=col.optional_str("HEALTH_HOST", default="0.0.0.0"),
+        health_port=col.integer("HEALTH_PORT", 8080, minimum=1, maximum=65535),
         instance_id=instance_id,
         shard_count=shard_count,
         shard_ids=shard_ids,

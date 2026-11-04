@@ -1,0 +1,29 @@
+# Keep secrets and local state out of the build context entirely - anything
+# copied in is readable in the image layers.
+.env
+*.env
+!.env.example
+
+.git
+.gitignore
+.github
+
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+*.egg-info
+dist
+build
+
+# Tests and docs are not needed at runtime and only grow the image.
+tests
+docs
+*.md
+!README.md
+
+logs
+*.log
+*.sqlite3

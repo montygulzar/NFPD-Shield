@@ -75,3 +75,54 @@ jobs:
           cat /tmp/out.txt
           test "$code" -eq 78
           grep -q "DISCORD_TOKEN is required" /tmp/out.txt
+
+  docker:
+    name: container build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose file renders
+        run: |
+          # env_file must exist for `compose config` to resolve; the values are
+          # never used, and .env is excluded from the build context anyway.
+          printf 'DISCORD_TOKEN=x\nAPPLICATION_ID=1\n' > .env
+          docker compose config
+          rm -f .env
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: nfpd-shield:ci
+          build-args: |
+            APP_VERSION=ci
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Image runs as a non-root user and reports its build
+        run: |
+          test "$(docker run --rm nfpd-shield:ci id -u)" = "10002"
+          docker run --rm nfpd-shield:ci python -c "import shield, aiohttp; print(shield.__name__)"
+          docker run --rm nfpd-shield:ci sh -c 'echo "$APP_VERSION $GIT_COMMIT"'
+
+      - name: Entrypoint refuses to start without configuration
+        run: |
+          set +e
+          out=$(docker run --rm nfpd-shield:ci 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test "$code" -ne 0
+          echo "$out" | grep -q "DISCORD_TOKEN is required"
+
+      - name: Healthcheck probe fails closed when nothing is listening
+        run: |
+          set +e
+          docker run --rm nfpd-shield:ci python healthcheck.py
+          code=$?
+          set -e
+          test "$code" -eq 1

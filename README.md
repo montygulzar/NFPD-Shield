@@ -165,9 +165,28 @@ Key invariants:
 
 ## Quick start
 
+Two supported deployments, one environment contract.
+
+**Docker**, alongside the other NFPD bots on a shared `nfpd-postgres` container:
+
 ```bash
 git clone https://github.com/montygulzar/NFPD-Shield.git
 cd NFPD-Shield
+cp .env.example .env && chmod 600 .env
+nano .env                          # DISCORD_TOKEN, APPLICATION_ID, OWNERID, DATABASE_URL
+GIT_COMMIT="$(git rev-parse --short HEAD)" docker compose build
+docker compose up -d && docker compose logs -f
+```
+
+Shield needs **its own database** on that PostgreSQL server (default
+`nfpd_shield`), not the mod bot's — both define a `guild_settings` table with
+different columns, and sharing one breaks both. The full rationale, the SQL to
+create the role and database, and the side-by-side notes are in
+[`docs/DOCKER.md`](docs/DOCKER.md).
+
+**systemd**, on a standalone VPS:
+
+```bash
 sudo ./deploy/install.sh          # creates the user, venv, database and unit
 sudoedit /etc/nfpd-shield/shield.env   # fill in DISCORD_TOKEN, APPLICATION_ID, OWNERID, DATABASE_URL
 sudo ./deploy/install.sh --migrate-only
@@ -239,6 +258,10 @@ hard coded and no ID is committed. `.env.example` is the full contract.
 - Per-guild settings (mode, thresholds, allowlist, log channel, snapshot
   cadence) live in PostgreSQL. Environment values are only bootstrap defaults
   applied the first time Shield sees a guild.
+- `DATABASE_URL` takes a plain `postgresql://` URL (the driver is added
+  automatically) or the discrete `POSTGRES_USER`/`PASSWORD`/`HOST`/`PORT`/`DB`
+  form. TLS is required for routable hosts and not for loopback, a Unix socket
+  or a single-label container name; `DB_REQUIRE_TLS` overrides that judgement.
 - Boot validation lists **every** problem at once and exits `78` (`EX_CONFIG`)
   without starting. It rejects placeholder tokens, non-numeric snowflakes,
   synchronous database drivers, remote databases without TLS, and contradictory
@@ -338,9 +361,25 @@ token. Only the guild owner can apply it, a pre-restore snapshot is taken
 first, the plan is recomputed against current state, and the result records
 old → new ID mapping plus precisely what was and was not restored.
 
+## Health endpoints
+
+Shield serves two read-only HTTP routes for container orchestration and
+monitoring, matching the contract the other NFPD services expose:
+
+| Route | Meaning | Codes |
+|---|---|---|
+| `GET /health` | Liveness: the process is up and its event loop is scheduling work. Stays 200 while dependencies are down, because a restart would not fix a database outage. | 200 |
+| `GET /ready` | Readiness: logged into Discord **and** PostgreSQL reachable. Tolerates a 90s gateway drop, since discord.py resumes on its own. | 200 / 503 |
+
+Neither is published to the host by the compose file, neither exposes guild
+data, configuration or secrets, and Shield has no state-changing HTTP route at
+all — everything that changes behaviour goes through a slash command with
+server-side authorization. Disable with `HEALTH_SERVER_ENABLED=false`.
+
 ## Operations
 
 ```bash
+docker compose ps && docker compose logs -f        # Docker deployment
 systemctl status nfpd-shield
 journalctl -u nfpd-shield -f                        # structured JSON, one object per line
 journalctl -u nfpd-shield -p warning --since '1 hour ago'
@@ -383,6 +422,7 @@ restoration, rate limits, database outage and restart recovery.
 |---|---|
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | pipeline, data model, audit correlation, concurrency, phased plan |
 | [`docs/THREAT_MATRIX.md`](docs/THREAT_MATRIX.md) | threats, detection, response, residual risk |
+| [`docs/DOCKER.md`](docs/DOCKER.md) | Docker deployment beside the other NFPD bots, database separation, running both |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | exact VPS commands, systemd, rollback |
 | [`docs/RUNBOOKS.md`](docs/RUNBOOKS.md) | incident runbooks |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | security review and deployment checklist |

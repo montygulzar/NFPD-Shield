@@ -1,4 +1,9 @@
-# Deployment (Linux VPS)
+# Deployment (Linux VPS, systemd)
+
+> Deploying onto the NFPD host next to the other bots? Use
+> [`DOCKER.md`](DOCKER.md) instead — that path attaches to the existing
+> `nfpd-postgres` container and the `nodey-monitoring` network. This document
+> covers a standalone VPS. Both share the same environment contract.
 
 Target: Debian 12 or Ubuntu 22.04/24.04 with systemd. Commands assume `sudo`.
 `deploy/install.sh` automates all of this; the manual steps are here so you can
