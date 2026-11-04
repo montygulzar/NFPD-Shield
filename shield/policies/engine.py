@@ -1,0 +1,354 @@
+"""Policy evaluation.
+
+The engine is pure: it takes already-normalised facts and returns a
+:class:`Decision`. It performs no I/O, which makes every rule in it directly
+unit-testable, including the false-positive guards.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from shield.constants import (
+    ActionKey,
+    Confidence,
+    ResponseAction,
+    Severity,
+    ShieldMode,
+)
+from shield.detection.windows import WindowHit
+from shield.events.normalize import NormalizedEvent
+from shield.policies.trust import TrustDecision
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyView:
+    """ORM-free snapshot of one guild policy row."""
+
+    action_key: ActionKey
+    enabled: bool
+    threshold_count: int
+    window_seconds: int
+    cooldown_seconds: int
+    response: ResponseAction
+    severity: Severity
+    requires_confirmed_actor: bool = True
+    dry_run: bool | None = None
+    options: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_row(cls, row: object) -> PolicyView:
+        return cls(
+            action_key=row.action_key,
+            enabled=bool(row.enabled),
+            threshold_count=int(row.threshold_count),
+            window_seconds=int(row.window_seconds),
+            cooldown_seconds=int(row.cooldown_seconds),
+            response=row.response,
+            severity=row.severity,
+            requires_confirmed_actor=bool(row.requires_confirmed_actor),
+            dry_run=row.dry_run,
+            options=dict(getattr(row, "options", None) or {}),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GuildView:
+    """ORM-free snapshot of the guild settings relevant to a decision."""
+
+    guild_id: int
+    enabled: bool
+    mode: ShieldMode
+    dry_run: bool
+    paused: bool
+    owner_id: int | None
+    policy_version: int
+    incident_cooldown_seconds: int = 60
+    lockdown_active: bool = False
+    raid_mode_active: bool = False
+
+    @classmethod
+    def from_row(cls, row: object) -> GuildView:
+        return cls(
+            guild_id=int(row.guild_id),
+            enabled=bool(row.enabled),
+            mode=row.mode,
+            dry_run=bool(row.dry_run),
+            paused=bool(row.paused),
+            owner_id=row.owner_id,
+            policy_version=int(row.policy_version),
+            incident_cooldown_seconds=int(getattr(row, "incident_cooldown_seconds", 60)),
+            lockdown_active=bool(getattr(row, "lockdown_active", False)),
+            raid_mode_active=bool(getattr(row, "raid_mode_active", False)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Decision:
+    """Outcome of evaluating one event against one policy."""
+
+    #: Persist an incident row?
+    create_incident: bool
+    #: Execute the enforcement side effects?
+    enforce: bool
+    #: Send a Discord notification?
+    notify: bool
+    response: ResponseAction
+    severity: Severity
+    reason: str
+    dry_run: bool
+    #: Machine-readable explanation for the audit trail / tests.
+    code: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_noop(self) -> bool:
+        return not (self.create_incident or self.enforce or self.notify)
+
+
+IGNORED = Decision(
+    create_incident=False,
+    enforce=False,
+    notify=False,
+    response=ResponseAction.ALERT_ONLY,
+    severity=Severity.LOW,
+    reason="no action required",
+    dry_run=True,
+    code="ignored",
+)
+
+
+class PolicyEngine:
+    """Deterministic policy evaluation.
+
+    ``global_dry_run`` is the master kill switch from the environment: when set,
+    no :class:`Decision` can ever carry ``enforce=True``.
+    """
+
+    def __init__(self, *, global_dry_run: bool = False) -> None:
+        self.global_dry_run = global_dry_run
+
+    def evaluate(
+        self,
+        *,
+        event: NormalizedEvent,
+        policy: PolicyView,
+        guild: GuildView,
+        trust: TrustDecision,
+        hit: WindowHit,
+        escalation_level: int = 0,
+        cooldown_allows: bool = True,
+        can_enforce: bool = True,
+        enforcement_blocked_reason: str | None = None,
+    ) -> Decision:
+        """Return the decision for one event.
+
+        Order of the guards matters and encodes the safety posture:
+        self-inflicted -> paused -> disabled policy -> trust -> threshold ->
+        attribution -> cooldown -> mode -> dry-run -> enforceability.
+        """
+        base_details: dict[str, Any] = {
+            "window_count": hit.count,
+            "window_distinct": hit.distinct,
+            "window_seconds": policy.window_seconds,
+            "threshold": policy.threshold_count,
+            "escalation_level": escalation_level,
+            "trust_basis": trust.basis,
+            "confidence": event.actor_confidence.value,
+        }
+
+        # 1. Shield's own writes must never feed back into Shield.
+        if event.self_inflicted:
+            return _noop("self_inflicted", "event generated by Shield's own action", base_details)
+
+        # 2. Emergency pause: owner-controlled, beats everything except logging.
+        if guild.paused:
+            return Decision(
+                create_incident=False,
+                enforce=False,
+                notify=False,
+                response=ResponseAction.ALERT_ONLY,
+                severity=policy.severity,
+                reason="protection paused by guild owner; event recorded only",
+                dry_run=True,
+                code="paused",
+                details=base_details,
+            )
+
+        # 3. Policy switched off for this guild.
+        if not policy.enabled:
+            return _noop("policy_disabled", f"policy {policy.action_key.value} disabled", base_details)
+
+        # 4. Trust. The guild owner is never punished but is always reported.
+        if trust.trusted:
+            if trust.is_guild_owner:
+                return Decision(
+                    create_incident=True,
+                    enforce=False,
+                    notify=True,
+                    response=ResponseAction.ALERT_ONLY,
+                    severity=policy.severity,
+                    reason=(
+                        "actor is the Discord guild owner: Shield alerts but never "
+                        "sanctions the owner"
+                    ),
+                    dry_run=True,
+                    code="owner_alert_only",
+                    details=base_details | {"owner_exempt": True},
+                )
+            return _noop("trusted", trust.detail, base_details)
+
+        # 5. Threshold.
+        if not hit.triggered:
+            return _noop(
+                "below_threshold",
+                f"{hit.count}/{policy.threshold_count} within {policy.window_seconds}s",
+                base_details,
+            )
+
+        # 6. Attribution. Guessing an actor is worse than missing one.
+        unattributed = event.actor_id is None
+        weak = event.actor_confidence is not Confidence.CONFIRMED
+        if policy.requires_confirmed_actor and (unattributed or weak):
+            return Decision(
+                create_incident=True,
+                enforce=False,
+                notify=True,
+                response=ResponseAction.ALERT_ONLY,
+                severity=policy.severity,
+                reason=(
+                    "threshold crossed but the actor could not be confirmed from the "
+                    "audit log; alerting instead of punishing a guessed user"
+                ),
+                dry_run=True,
+                code="unconfirmed_actor",
+                details=base_details | {"unattributed": unattributed},
+            )
+
+        # 7. Cooldown / loop prevention.
+        if not cooldown_allows:
+            return Decision(
+                create_incident=False,
+                enforce=False,
+                notify=False,
+                response=ResponseAction.ALERT_ONLY,
+                severity=policy.severity,
+                reason="within incident cooldown for this actor/action",
+                dry_run=True,
+                code="cooldown",
+                details=base_details,
+            )
+
+        response = self._escalate(policy, escalation_level)
+        severity = self._severity(policy, escalation_level)
+
+        # 8. Mode. A guild not explicitly enabled never enforces.
+        if not guild.enabled or guild.mode is ShieldMode.ALERT_ONLY:
+            return Decision(
+                create_incident=True,
+                enforce=False,
+                notify=True,
+                response=ResponseAction.ALERT_ONLY,
+                severity=severity,
+                reason=(
+                    "alert-only: protection is not enabled for this guild"
+                    if not guild.enabled
+                    else "alert-only mode: enforcement suppressed by configuration"
+                ),
+                dry_run=True,
+                code="alert_only_mode",
+                details=base_details | {"would_have_done": response.value},
+            )
+
+        # 9. Dry run (global, guild or policy level).
+        policy_dry = policy.dry_run if policy.dry_run is not None else guild.dry_run
+        if self.global_dry_run or policy_dry:
+            return Decision(
+                create_incident=True,
+                enforce=False,
+                notify=True,
+                response=response,
+                severity=severity,
+                reason="dry-run: enforcement simulated, no Discord write performed",
+                dry_run=True,
+                code="dry_run",
+                details=base_details | {"would_have_done": response.value},
+            )
+
+        # 10. Enforceability (hierarchy, permissions, budget).
+        if not can_enforce:
+            return Decision(
+                create_incident=True,
+                enforce=False,
+                notify=True,
+                response=ResponseAction.ALERT_ONLY,
+                severity=Severity.CRITICAL,
+                reason=(
+                    enforcement_blocked_reason
+                    or "enforcement is not possible; containment NOT achieved"
+                ),
+                dry_run=False,
+                code="enforcement_blocked",
+                details=base_details | {"intended_response": response.value},
+            )
+
+        return Decision(
+            create_incident=True,
+            enforce=True,
+            notify=True,
+            response=response,
+            severity=severity,
+            reason=(
+                f"{hit.count} {policy.action_key.value} event(s) within "
+                f"{policy.window_seconds}s by a confirmed, non-allowlisted actor"
+            ),
+            dry_run=False,
+            code="enforce",
+            details=base_details,
+        )
+
+    # -- escalation ----------------------------------------------------
+    @staticmethod
+    def _escalate(policy: PolicyView, level: int) -> ResponseAction:
+        """Escalate repeat offenders, never de-escalate.
+
+        A second distinct incident for the same actor/action promotes an
+        alert-only policy to role stripping, and a third promotes to guild
+        lockdown. Message-level policies escalate from deletion to timeout.
+        """
+        if level <= 0:
+            return policy.response
+        if policy.response is ResponseAction.ALERT_ONLY:
+            return (
+                ResponseAction.STRIP_DANGEROUS_ROLES
+                if level >= 2
+                else ResponseAction.ALERT_ONLY
+            )
+        if policy.response is ResponseAction.DELETE_MESSAGES:
+            return ResponseAction.TIMEOUT
+        if policy.response is ResponseAction.STRIP_DANGEROUS_ROLES and level >= 2:
+            return ResponseAction.LOCKDOWN
+        return policy.response
+
+    @staticmethod
+    def _severity(policy: PolicyView, level: int) -> Severity:
+        if level <= 0:
+            return policy.severity
+        order = [Severity.LOW, Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL]
+        index = min(order.index(policy.severity) + level, len(order) - 1)
+        return order[index]
+
+
+def _noop(code: str, reason: str, details: dict[str, Any]) -> Decision:
+    return Decision(
+        create_incident=False,
+        enforce=False,
+        notify=False,
+        response=ResponseAction.ALERT_ONLY,
+        severity=Severity.LOW,
+        reason=reason,
+        dry_run=True,
+        code=code,
+        details=details,
+    )

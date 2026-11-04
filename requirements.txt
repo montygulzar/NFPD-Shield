@@ -1,0 +1,6 @@
+# Runtime dependencies for NFPD Shield (pinned to compatible minors).
+discord.py>=2.4,<3
+SQLAlchemy[asyncio]>=2.0,<3
+asyncpg>=0.29
+alembic>=1.13
+cryptography>=42
