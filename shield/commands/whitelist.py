@@ -70,6 +70,16 @@ class WhitelistGroup(
         if extra_scope:
             scopes.add(TrustScope(extra_scope.value))
 
+        if TrustScope.MODERATION_PROXY in scopes and not (user is not None and user.bot):
+            await respond(
+                interaction,
+                "`moderation_proxy` can only be given to a **bot user**. It tells Shield "
+                "to trust the moderator ID that bot writes into its audit reasons - a "
+                "person can type any reason they like, so a human proxy could frame "
+                "someone else.",
+            )
+            return
+
         entity_type = "user" if user is not None else "role"
         entity_id = int(user.id) if user is not None else int(role.id)
         guild = interaction.guild
@@ -116,6 +126,13 @@ class WhitelistGroup(
             note = (
                 "\n`manage_shield` grants **command authority only** - the delegate is "
                 "still policed by every detector."
+            )
+        if TrustScope.MODERATION_PROXY in scopes:
+            note += (
+                "\n`moderation_proxy`: Shield now reads the moderator behind each of this "
+                "bot's bans and kicks from its audit reason and applies the normal "
+                "thresholds to **that moderator**, not the bot. The bot itself gets no "
+                "exemption from this scope."
             )
         detection_note = (
             f"\nExempt from **{len(covered)}** detector(s): `{', '.join(covered)}`"

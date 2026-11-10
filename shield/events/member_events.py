@@ -126,6 +126,7 @@ class MemberEventsCog(commands.Cog):
             payload={
                 "target_name": str(member),
                 "attribution_reason": attribution.reason,
+                "audit_changes": attribution.changes,
             },
         )
         await self.pipeline.handle(event, guild)

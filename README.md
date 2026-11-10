@@ -318,8 +318,11 @@ exactly the permissions a compromised-admin attack abuses.
 | `/shield lockdown status` | delegate | current protective state |
 
 Allowlist scopes are narrow on purpose: `all`, `destructive`, `webhooks`,
-`messages`, `bots`, `guild_settings`, and `manage_shield` (command authority
-only — a delegate is still policed by every detector).
+`messages`, `bots`, `guild_settings`, `manage_shield` (command authority
+only — a delegate is still policed by every detector), and `moderation_proxy`
+(bots only: Shield reads the moderator behind a moderation bot's bans and kicks
+from its audit reason and polices that moderator instead of the bot — see
+[`docs/DOCKER.md`](docs/DOCKER.md)).
 
 ## Safe rollout procedure
 

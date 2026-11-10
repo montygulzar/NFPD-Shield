@@ -49,6 +49,7 @@ the Discord API, it is listed as unsupported rather than silently omitted.
 | Target matching → `CONFIRMED` | yes | A | the only state that authorises a sanction |
 | Unmatched fresh entry → `LIKELY` | yes | A | never sanctions |
 | Stale / absent / forbidden → `UNKNOWN` | yes | A | alert only |
+| Moderation-bot pass-through (`moderation_proxy`): the moderator behind a bot's ban/kick is the actor | yes | A | reads the ID the bot writes into its audit reason; bots only; unparseable reasons sanction nobody |
 | Single-use audit entries per guild | yes | A | bounded LRU; one entry cannot blame two events |
 | Clock-skew rejection | yes | A | future-dated entries are ignored |
 | Missing-permission degradation reporting | yes | A | surfaced by `/shield health` |
