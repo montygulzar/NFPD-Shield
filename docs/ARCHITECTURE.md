@@ -88,7 +88,7 @@ ingest → normalize → deduplicate → audit attribution → policy evaluation
 |---|---|---|
 | 1 | self-action suppression | A write Shield is about to make is pre-registered in `SelfActionGuard`; a matching event is flagged `self_inflicted` and ignored by the engine (but still logged). |
 | 2 | guild state | TTL-cached (30s) settings, policies and allowlist. On a database outage the stale cache is reused; if there is none, the event is dropped with `no_guild_state`. |
-| 3 | dedupe + persist | `event_records.dedupe_key` is globally unique. A duplicate returns immediately — **before** any audit-log read. |
+| 3 | dedupe + persist | `event_records.dedupe_key` is globally unique. A duplicate returns immediately — **before** any audit-log read. Per-message events (spam, duplicates, mentions) are deduplicated in memory instead and persisted only if they lead to an incident, so chat volume never reaches PostgreSQL; exempt channels and disabled policies exit here. |
 | 4 | audit attribution | Only for audit-correlated actions whose actor is not already confirmed. Result is attached to the stored row. |
 | 5 | trust | Owner / bot-self / scoped allowlist. |
 | 6 | window | Monotonic sliding window, keyed per detector family. |
@@ -126,7 +126,7 @@ administrative actions) is exact.
 
 | Detector | Window key | Notes |
 |---|---|---|
-| administrative actions | `(guild, action, actor_or_"unattributed")` | unattributable bursts are still reported |
+| administrative actions | `(guild, action, actor_or_"unattributed")` | the actor key is used only for `CONFIRMED` attribution; `LIKELY`/`UNKNOWN` share the unattributed window, so a guess never counts against a person |
 | `message_spam` | `(guild, action, author)` | |
 | `duplicate_spam` | `(guild, action, author, content_hash)` | content is hashed, never stored |
 | `mass_mention` | `(guild, action, author)` with distinct mention IDs | repeated mentions of one user count once; `@everyone` triggers immediately |
@@ -180,7 +180,6 @@ guild-level entry is accepted as `CONFIRMED` on recency alone — which is why
 | `enforcement_actions` | one row per response step, before/after state | `UNIQUE(idempotency_key)` ← idempotency |
 | `snapshots` | versioned structural backups | `UNIQUE(guild_id, version)` |
 | `restore_jobs` | preview/apply runs, plan, result, ID map, approval token | indexed by `(guild_id, approval_token)` |
-| `audit_cursors` | highest consumed audit entry per guild+action | PK `(guild_id, audit_action)` |
 | `command_audit` | every privileged invocation, allowed or denied | indexed by guild and user |
 | `cooldowns` | durable cooldown + escalation level | PK `(guild_id, scope_key)` |
 
@@ -196,7 +195,9 @@ sync equivalent for DDL, so one variable serves both.
 
 ## 6. Concurrency and multi-process operation
 
-- **Per-guild advisory locks.** `Database.guild_lock` wraps
+- **Per-guild advisory locks.** `Database.guild_lock` yields the session that
+  holds the lock (the guarded work runs on that same connection, so a burst of
+  waiters cannot starve the holder of a pool slot). It wraps
   `pg_advisory_xact_lock(guild_id ^ namespace, purpose)`. Incident creation,
   restores and snapshots take it, so two processes observing the same guild
   cannot create duplicate incidents or race a restore. On SQLite it degrades to

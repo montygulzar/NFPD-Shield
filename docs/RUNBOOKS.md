@@ -60,8 +60,8 @@ disappearing; a flood of joins.
      `/shield thresholds set action:channel_delete dry_run:true`
    - Exempt the principal with the narrowest scope that works, and an expiry:
      `/shield whitelist add user:@Mod scope:destructive expires_in_hours:8`
-   - Exempt a busy channel from message policies by setting
-     `exempt_channel_ids` in that policy's options.
+   - Exempt a busy channel from a message detector:
+     `/shield thresholds set action:message_spam exempt_channel:#bots`
 5. **Resume**: `/shield resume`.
 6. **Planned maintenance in future**: pause or allowlist *before* the work, not
    after. A time-boxed allowlist entry is the cleanest option.
@@ -228,7 +228,6 @@ DELETE FROM snapshots          WHERE guild_id = 123456789012345678;
 DELETE FROM restore_jobs       WHERE guild_id = 123456789012345678;
 DELETE FROM cooldowns          WHERE guild_id = 123456789012345678;
 DELETE FROM command_audit      WHERE guild_id = 123456789012345678;
-DELETE FROM audit_cursors      WHERE guild_id = 123456789012345678;
 ```
 
 ## 9. High false-positive rate after rollout

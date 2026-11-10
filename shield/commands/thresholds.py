@@ -10,6 +10,11 @@ from shield.constants import ActionKey, ResponseAction, Severity
 from shield.db.repositories import UnitOfWork
 from shield.policies.defaults import DEFAULTS_BY_KEY
 
+#: Detectors that work per channel and so can exempt one.
+MESSAGE_ACTIONS = frozenset(
+    {ActionKey.MESSAGE_SPAM, ActionKey.DUPLICATE_SPAM, ActionKey.MASS_MENTION}
+)
+
 ACTION_CHOICES = [
     app_commands.Choice(name=key.value.replace("_", " "), value=key.value)
     for key in list(ActionKey)[:25]
@@ -98,6 +103,8 @@ class ThresholdsGroup(
         enabled="Enable or disable this detector",
         dry_run="Simulate this detector only (overrides the guild setting)",
         require_confirmed_actor="Require confirmed audit-log attribution before enforcing",
+        exempt_channel="Message detectors only: stop policing this channel",
+        unexempt_channel="Message detectors only: police this channel again",
     )
     @app_commands.choices(action=ACTION_CHOICES, response=RESPONSE_CHOICES, severity=SEVERITY_CHOICES)
     async def set_values(
@@ -112,8 +119,12 @@ class ThresholdsGroup(
         enabled: bool | None = None,
         dry_run: bool | None = None,
         require_confirmed_actor: bool | None = None,
+        exempt_channel: discord.TextChannel | None = None,
+        unexempt_channel: discord.TextChannel | None = None,
     ) -> None:
         params = {
+            "exempt_channel": getattr(exempt_channel, "id", None),
+            "unexempt_channel": getattr(unexempt_channel, "id", None),
             "action": action.value,
             "threshold": threshold,
             "window": window,
@@ -141,6 +152,8 @@ class ThresholdsGroup(
                 enabled,
                 dry_run,
                 require_confirmed_actor,
+                exempt_channel,
+                unexempt_channel,
             )
         ):
             await respond(interaction, "Nothing to change: supply at least one field.")
@@ -149,6 +162,14 @@ class ThresholdsGroup(
         bot = interaction.client
         guild_id = interaction.guild_id
         action_key = ActionKey(action.value)
+        if (exempt_channel or unexempt_channel) and action_key not in MESSAGE_ACTIONS:
+            await respond(
+                interaction,
+                "Channel exemptions only apply to the message detectors: "
+                + ", ".join(f"`{a.value}`" for a in sorted(MESSAGE_ACTIONS, key=lambda a: a.value))
+                + ".",
+            )
+            return
         warnings: list[str] = []
         if threshold == 1:
             warnings.append(
@@ -165,6 +186,19 @@ class ThresholdsGroup(
             async with bot.db.begin() as session:
                 uow = UnitOfWork(session)
                 await uow.guilds.ensure(guild_id)
+                options = None
+                if exempt_channel or unexempt_channel:
+                    current = await uow.policies.get(guild_id, action_key)
+                    exempt = {
+                        int(c) for c in ((current.options or {}) if current else {}).get(
+                            "exempt_channel_ids", []
+                        )
+                    }
+                    if exempt_channel:
+                        exempt.add(int(exempt_channel.id))
+                    if unexempt_channel:
+                        exempt.discard(int(unexempt_channel.id))
+                    options = {"exempt_channel_ids": sorted(exempt)}
                 updated = await uow.policies.set_values(
                     guild_id,
                     action_key,
@@ -177,6 +211,7 @@ class ThresholdsGroup(
                     enabled=enabled,
                     dry_run=dry_run,
                     requires_confirmed_actor=require_confirmed_actor,
+                    options=options,
                 )
                 if updated is None:
                     await respond(interaction, f"No policy row for `{action_key.value}`.")
@@ -188,6 +223,11 @@ class ThresholdsGroup(
                     f"response `{updated.response.value}`, severity `{updated.severity.value}`, "
                     f"enabled {updated.enabled}, dry-run {updated.dry_run}"
                 )
+                exempt_now = (updated.options or {}).get("exempt_channel_ids") or []
+                if action_key in MESSAGE_ACTIONS:
+                    summary += "\nexempt channels: " + (
+                        ", ".join(f"<#{c}>" for c in exempt_now) or "none"
+                    )
         except ValueError as exc:
             await respond(interaction, f"**Rejected:** {exc}")
             return

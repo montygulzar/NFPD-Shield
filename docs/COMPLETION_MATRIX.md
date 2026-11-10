@@ -122,6 +122,8 @@ the Discord API, it is listed as unsupported rather than silently omitted.
 | Snowflake, URL, TLS, boolean, range and contradiction checks | yes | A | |
 | systemd `EnvironmentFile` compatibility | yes | S | documented differences from python-dotenv |
 | Per-guild settings in PostgreSQL | yes | A | env values are bootstrap defaults only |
+| Per-channel exemptions for message detectors | yes | A | `/shield thresholds set ... exempt_channel:` |
+| Approved-guild restriction (`APPROVED_GUILD_IDS`, optional auto-leave) | yes | A | events ignored and commands refused elsewhere |
 | Alembic migrations, up and down | yes | A+S | round-trip verified |
 | Default policy seeding, idempotent | yes | A | |
 | Connection pooling, pre-ping, recycling | yes | — | |
@@ -159,7 +161,7 @@ the Discord API, it is listed as unsupported rather than silently omitted.
 
 | Layer | Count | Scope |
 |---|---|---|
-| `tests/unit` | 157 | config validation, windows, trust, policy engine, hierarchy safety, audit correlation, rate limits, self-guard, redaction, dedupe keys, snapshot serialisation |
-| `tests/integration` | 121 | repositories and isolation, the wired pipeline, backup/restore, slash commands and authorization, PostgreSQL-specific paths (5, skipped without a server) |
+| `tests/unit` | 163 | config validation, windows, trust, policy engine, hierarchy safety, audit correlation, rate limits, self-guard, redaction, dedupe keys, snapshot serialisation |
+| `tests/integration` | 141 | repositories and isolation, the wired pipeline, backup/restore, slash commands and authorization, PostgreSQL-specific paths (8, skipped without a server) |
 | `tests/simulation` | 28 | end-to-end attack scenarios through the real gateway cogs, mapped to the threat matrix |
-| **Total** | **306** (301 run anywhere + 5 PostgreSQL-conditional) | the Discord API is always faked; no destructive action is ever taken against a real guild |
+| **Total** | **332** (324 run anywhere + 8 PostgreSQL-conditional) | the Discord API is always faked; no destructive action is ever taken against a real guild |

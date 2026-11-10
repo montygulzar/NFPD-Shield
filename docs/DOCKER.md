@@ -252,7 +252,7 @@ docker compose logs --no-color | jq 'select(.correlation_id=="evt-...")'
 ```
 
 Shield writes nothing to disk; rotation is the Docker daemon's job. `LOG_FORMAT`
-accepts `json` (one object per line, for an aggregator) or `console`.
+accepts `json` (one object per line, for an aggregator) or `text`/`console`.
 
 ## Running both bots side by side
 

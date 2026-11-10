@@ -302,6 +302,10 @@ class ShieldConfig:
     health_host: str
     health_port: int
 
+    #: When non-empty, Shield operates ONLY in these guilds.
+    approved_guild_ids: tuple[int, ...]
+    leave_unapproved_guilds: bool
+
     instance_id: str
     shard_count: int | None
     shard_ids: tuple[int, ...]
@@ -312,6 +316,10 @@ class ShieldConfig:
     run_migrations_on_boot: bool
 
     operator_ids: frozenset[int] = field(default_factory=frozenset)
+
+    def guild_approved(self, guild_id: int) -> bool:
+        """True when Shield may operate in this guild (always, if no list is set)."""
+        return not self.approved_guild_ids or guild_id in self.approved_guild_ids
 
     def is_operator(self, user_id: int) -> bool:
         """True for the global bot operator(s).
@@ -349,6 +357,8 @@ class ShieldConfig:
             "health_server_enabled": self.health_server_enabled,
             "health_host": self.health_host,
             "health_port": self.health_port,
+            "approved_guild_ids": list(self.approved_guild_ids),
+            "leave_unapproved_guilds": self.leave_unapproved_guilds,
             "instance_id": self.instance_id,
             "shard_count": self.shard_count,
             "shard_ids": list(self.shard_ids),
@@ -506,7 +516,10 @@ def _validate_logging(col: _Collector) -> LoggingConfig:
     level = col.choice(
         "LOG_LEVEL", "info", {"debug", "info", "warning", "error", "critical"}
     ).upper()
-    fmt = col.choice("LOG_FORMAT", "json", {"json", "console"})
+    # "text" is the spelling the other NFPD services use for the readable format.
+    fmt = col.choice("LOG_FORMAT", "json", {"json", "console", "text"})
+    if fmt == "text":
+        fmt = "console"
     raw_file = col.optional_str("LOG_FILE")
     log_file: Path | None = None
     if raw_file:
@@ -591,8 +604,28 @@ def load_config(env: Env | None = None, *, allow_dotenv: bool | None = None) -> 
             )
 
     application_id = col.snowflake("APPLICATION_ID", "SHIELD_APPLICATION_ID") or 0
-    owner_id = col.snowflake("OWNERID", "OWNER_ID", "SHIELD_OWNER_ID") or 0
-    extra_ops = col.snowflake_list("EXTRA_OPERATOR_IDS")
+    # OWNER_IDS (plural, comma-separated) is the form the other NFPD services
+    # use. Its first entry stands in for OWNERID when that is unset; every entry
+    # is an operator either way.
+    owner_list = col.snowflake_list("OWNER_IDS")
+    single, _ = col.raw("OWNERID", "OWNER_ID", "SHIELD_OWNER_ID")
+    if single is None and owner_list:
+        owner_id = owner_list[0]
+    else:
+        owner_id = col.snowflake("OWNERID", "OWNER_ID", "SHIELD_OWNER_ID") or 0
+    extra_ops = tuple(
+        dict.fromkeys((*col.snowflake_list("EXTRA_OPERATOR_IDS"), *owner_list))
+    )
+    extra_ops = tuple(i for i in extra_ops if i != owner_id)
+
+    approved_guild_ids = col.snowflake_list("APPROVED_GUILD_IDS")
+    leave_unapproved = col.boolean("LEAVE_UNAPPROVED_GUILDS", False)
+    if leave_unapproved and not approved_guild_ids:
+        col.fail(
+            "LEAVE_UNAPPROVED_GUILDS=true with an empty APPROVED_GUILD_IDS is "
+            "contradictory: Shield would leave every server. List the approved "
+            "guild IDs or set LEAVE_UNAPPROVED_GUILDS=false."
+        )
 
     database = _validate_database(col)
     logging_cfg = _validate_logging(col)
@@ -698,6 +731,8 @@ def load_config(env: Env | None = None, *, allow_dotenv: bool | None = None) -> 
         health_server_enabled=col.boolean("HEALTH_SERVER_ENABLED", True),
         health_host=col.optional_str("HEALTH_HOST", default="0.0.0.0"),
         health_port=col.integer("HEALTH_PORT", 8080, minimum=1, maximum=65535),
+        approved_guild_ids=approved_guild_ids,
+        leave_unapproved_guilds=leave_unapproved,
         instance_id=instance_id,
         shard_count=shard_count,
         shard_ids=shard_ids,

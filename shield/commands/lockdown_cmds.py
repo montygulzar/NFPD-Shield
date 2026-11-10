@@ -44,12 +44,9 @@ class LockdownGroup(
         async with bot.db.begin() as session:
             uow = UnitOfWork(session)
             await uow.guilds.ensure(guild.id)
-            await uow.guilds.update(
-                guild.id,
-                lockdown_active=True,
+            await uow.guilds.enter_protective_mode(
+                guild.id, "lockdown", result.previous_state,
                 lockdown_reason=f"{reason} (by {interaction.user.id})",
-                lockdown_state=result.previous_state,
-                protective_mode="lockdown",
             )
         bot.pipeline.state_cache.invalidate(guild.id)
         body = f"**Lockdown enabled.**\n{result.summary()}"
@@ -170,12 +167,8 @@ class LockdownGroup(
             async with bot.db.begin() as session:
                 uow = UnitOfWork(session)
                 await uow.guilds.ensure(guild.id)
-                await uow.guilds.update(
-                    guild.id,
-                    raid_mode_active=True,
-                    raid_mode_until=until,
-                    raid_mode_state=result.previous_state,
-                    protective_mode="raid",
+                await uow.guilds.enter_protective_mode(
+                    guild.id, "raid_mode", result.previous_state, raid_mode_until=until
                 )
             bot.pipeline.state_cache.invalidate(guild.id)
             await respond(

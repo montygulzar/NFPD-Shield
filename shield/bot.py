@@ -73,6 +73,10 @@ class ShieldBot(commands.Bot):
             help_command=None,
             chunk_guilds_at_startup=False,
             max_messages=None,  # Shield keeps no message cache
+            # Shield never needs to ping @everyone or a role. Names and reasons
+            # in its output are user-influenced, so this is enforced at the
+            # client rather than trusted to each call site.
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False),
             shard_count=config.shard_count,
             shard_ids=list(config.shard_ids) or None,
         )
@@ -122,6 +126,7 @@ class ShieldBot(commands.Bot):
         )
         self.health = HealthServer(self)
         self._maintenance_task: asyncio.Task | None = None
+        self._maintenance_ticks = 0
         self._bootstrapped = False
 
     # -- lifecycle -----------------------------------------------------
@@ -226,6 +231,8 @@ class ShieldBot(commands.Bot):
     async def _bootstrap_guilds(self) -> None:
         """Ensure a row per guild, take startup snapshots, rehydrate windows."""
         for guild in list(self.guilds):
+            if await self._reject_unapproved(guild):
+                continue
             try:
                 async with self.db.begin() as session:
                     uow = UnitOfWork(session)
@@ -245,9 +252,35 @@ class ShieldBot(commands.Bot):
             except Exception:  # noqa: BLE001 - one bad guild must not stop boot
                 log.exception("guild bootstrap failed", extra={"guild_id": guild.id})
 
+    async def _reject_unapproved(self, guild: discord.Guild) -> bool:
+        """Handle a guild outside APPROVED_GUILD_IDS. True when it was rejected.
+
+        Shield holds Manage Roles, Manage Guild and Moderate Members; it should
+        not sit, armed, in a server nobody approved. An unapproved guild is
+        always ignored, and left when LEAVE_UNAPPROVED_GUILDS is set.
+        """
+        if self.shield_config.guild_approved(guild.id):
+            return False
+        log.warning(
+            "guild is not in APPROVED_GUILD_IDS; Shield will not operate there",
+            extra={
+                "guild_id": guild.id,
+                "guild_name": guild.name,
+                "leaving": self.shield_config.leave_unapproved_guilds,
+            },
+        )
+        if self.shield_config.leave_unapproved_guilds:
+            try:
+                await guild.leave()
+            except Exception:  # noqa: BLE001
+                log.exception("could not leave unapproved guild", extra={"guild_id": guild.id})
+        return True
+
     async def on_guild_join(self, guild: discord.Guild) -> None:
-        log.info("joined guild", extra={"guild_id": guild.id, "name": guild.name})
+        log.info("joined guild", extra={"guild_id": guild.id, "guild_name": guild.name})
         METRICS.gauge("guilds", len(self.guilds))
+        if await self._reject_unapproved(guild):
+            return
         try:
             async with self.db.begin() as session:
                 uow = UnitOfWork(session)
@@ -371,7 +404,11 @@ class ShieldBot(commands.Bot):
             except Exception:  # noqa: BLE001
                 log.exception("could not lift raid mode", extra={"guild_id": guild_id})
 
-        # Retention pruning, once per maintenance pass; cheap because indexed.
+        # Retention pruning is a bulk delete; hourly is plenty.
+        self._maintenance_ticks += 1
+        if self._maintenance_ticks % 60 != 1:
+            METRICS.gauge("detection_windows", self.pipeline.windows.size())
+            return report
         try:
             async with self.db.begin() as session:
                 uow = UnitOfWork(session)

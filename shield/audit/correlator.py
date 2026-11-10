@@ -109,8 +109,14 @@ class AuditCorrelator:
         target_id: int | None,
         occurred_at: datetime,
         extra_target_ids: Iterable[int] = (),
+        max_attempts: int | None = None,
     ) -> Attribution:
-        """Find the actor behind a destructive event."""
+        """Find the actor behind a destructive event.
+
+        ``max_attempts`` overrides the configured retry budget for callers that
+        expect "no entry" to be the common answer.
+        """
+        attempts_allowed = max(1, max_attempts or self.max_attempts)
         if action_key in GATEWAY_ONLY:
             return Attribution(
                 None,
@@ -142,7 +148,7 @@ class AuditCorrelator:
 
         backoff = 1.0
         best_loose: Attribution | None = None
-        for attempt in range(1, self.max_attempts + 1):
+        for attempt in range(1, attempts_allowed + 1):
             try:
                 entries = await self._fetch(guild, actions)
             except Exception as exc:  # noqa: BLE001 - normalised below
@@ -167,7 +173,7 @@ class AuditCorrelator:
                         "retry_after": retry_after.get("Retry-After") if retry_after else None,
                     },
                 )
-                if attempt >= self.max_attempts:
+                if attempt >= attempts_allowed:
                     return Attribution(
                         None,
                         Confidence.UNKNOWN,
@@ -232,7 +238,7 @@ class AuditCorrelator:
                         changes=changes,
                     )
 
-            if attempt < self.max_attempts:
+            if attempt < attempts_allowed:
                 await self._sleep(min(backoff, 8.0))
                 backoff *= 2
 
@@ -245,7 +251,7 @@ class AuditCorrelator:
             Confidence.UNKNOWN,
             reason=(
                 "no matching audit-log entry within "
-                f"{self.window:.0f}s after {self.max_attempts} attempt(s); "
+                f"{self.window:.0f}s after {attempts_allowed} attempt(s); "
                 "the action will be logged and alerted but nobody will be sanctioned"
             ),
         )

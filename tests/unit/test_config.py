@@ -296,3 +296,38 @@ def test_dotenv_parser_is_systemd_compatible(tmp_path, monkeypatch):
     assert values["EXPORTED"] == "exported"
     assert values["NOT_EXPANDED"] == "$HOME/literal"  # no shell expansion
     assert values["EMPTY"] == ""
+
+
+def test_owner_ids_plural_form_is_accepted():
+    """The other NFPD services write OWNER_IDS; a shared .env must not fail boot."""
+    env = dict(GOOD)
+    del env["OWNERID"]
+    env["OWNER_IDS"] = "123456789012345679, 223456789012345679"
+    config = load_config(env, allow_dotenv=False)
+    assert config.owner_id == 123456789012345679
+    assert config.is_operator(223456789012345679)
+
+
+def test_ownerid_wins_and_owner_ids_become_operators():
+    config = load(OWNER_IDS="223456789012345679")
+    assert config.owner_id == 123456789012345679
+    assert config.is_operator(223456789012345679)
+
+
+def test_log_format_text_is_the_console_format():
+    assert load(LOG_FORMAT="text").logging.fmt == "console"
+
+
+def test_approved_guilds_default_to_everywhere():
+    config = load()
+    assert config.approved_guild_ids == () and config.guild_approved(42)
+
+
+def test_approved_guilds_restrict_operation():
+    config = load(APPROVED_GUILD_IDS="123456789012345670")
+    assert config.guild_approved(123456789012345670)
+    assert not config.guild_approved(123456789012345671)
+
+
+def test_leaving_unapproved_guilds_requires_an_approved_list():
+    assert any("contradictory" in e for e in errors_for(LEAVE_UNAPPROVED_GUILDS="true"))

@@ -98,10 +98,15 @@ class MemberEventsCog(commands.Cog):
             action_key=ActionKey.MASS_KICK,
             target_id=member.id,
             occurred_at=datetime.now(tz=timezone.utc),
+            # Most departures are voluntary, so "no entry" is the normal answer;
+            # one retry covers audit-log lag without tripling the API cost of
+            # every leave.
+            max_attempts=2,
         )
-        if attribution.actor_id is None:
-            # No kick entry -> the member left on their own (or the audit log is
-            # unreadable). Either way there is nothing to attribute.
+        if not attribution.confirmed:
+            # No kick entry naming THIS member -> they left on their own (or the
+            # audit log is unreadable). A fresh kick entry for someone else is
+            # not evidence about this departure, so LIKELY is not enough.
             if attribution.degraded:
                 log.info(
                     "member departure could not be classified (audit log unreadable)",

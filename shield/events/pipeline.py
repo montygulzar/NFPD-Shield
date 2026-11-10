@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -50,6 +51,17 @@ from shield.policies.engine import Decision, GuildView, PolicyEngine, PolicyView
 from shield.policies.trust import TrustDecision, entries_from_rows, evaluate_trust
 
 log = get_logger("pipeline")
+
+#: Per-message detectors. Every chat message produces these events, so they are
+#: deduplicated in memory and only written to PostgreSQL when they lead
+#: somewhere (an incident or alert). Their windows are seconds long, so nothing
+#: is lost across a restart, and a quiet guild costs the database nothing.
+HIGH_VOLUME_ACTIONS: frozenset[ActionKey] = frozenset(
+    {ActionKey.MESSAGE_SPAM, ActionKey.DUPLICATE_SPAM, ActionKey.MASS_MENTION}
+)
+
+#: Size of the in-memory dedupe ring for high-volume events.
+RECENT_KEYS_CAPACITY = 8192
 
 #: How long a cached guild configuration stays valid. Short enough that a
 #: ``/shield thresholds set`` takes effect quickly, long enough that message
@@ -185,6 +197,7 @@ class EventPipeline:
             },
         )
         self.degraded_db = False
+        self._recent_keys: OrderedDict[str, None] = OrderedDict()
 
     # -- public --------------------------------------------------------
     async def handle(self, event: NormalizedEvent, guild) -> PipelineResult:  # noqa: ANN001
@@ -200,6 +213,8 @@ class EventPipeline:
                 return PipelineResult(False, "pipeline_error")
 
     async def _handle(self, event: NormalizedEvent, guild) -> PipelineResult:  # noqa: ANN001
+        if not self.config.guild_approved(event.guild_id):
+            return PipelineResult(False, "guild_not_approved")
         METRICS.incr("events_ingested_total", action=event.action_key.value)
 
         # --- stage 1: self-action suppression -------------------------
@@ -224,14 +239,28 @@ class EventPipeline:
         if policy is None:
             return PipelineResult(False, "no_policy", detail="no policy row for this action")
 
-        # --- stage 3: durable dedupe + persistence --------------------
+        high_volume = event.action_key in HIGH_VOLUME_ACTIONS
+        if high_volume:
+            if not policy.enabled or state.guild.paused:
+                return PipelineResult(True, "policy_disabled" if not policy.enabled else "paused")
+            exempt = (policy.options or {}).get("exempt_channel_ids") or ()
+            if event.channel_id is not None and int(event.channel_id) in {int(c) for c in exempt}:
+                return PipelineResult(True, "exempt_channel")
+
+        # --- stage 3: dedupe (+ persistence) --------------------------
         # Deduplication happens BEFORE attribution so that a redelivered event
         # is dropped without spending an audit-log read, and so the dedupe key
         # cannot shift because attribution differed between deliveries.
-        event_row_id, inserted = await self._persist_event(event)
-        if inserted is False:
-            METRICS.incr("events_deduplicated_total", action=event.action_key.value)
-            return PipelineResult(True, "duplicate", duplicate=True)
+        event_row_id: int | None = None
+        if high_volume:
+            if self._seen_recently(event.dedupe_key):
+                METRICS.incr("events_deduplicated_total", action=event.action_key.value)
+                return PipelineResult(True, "duplicate", duplicate=True)
+        else:
+            event_row_id, inserted = await self._persist_event(event)
+            if inserted is False:
+                METRICS.incr("events_deduplicated_total", action=event.action_key.value)
+                return PipelineResult(True, "duplicate", duplicate=True)
 
         # --- stage 4: audit attribution -------------------------------
         if (
@@ -268,7 +297,8 @@ class EventPipeline:
                 )
 
         # --- stage 5: trust -------------------------------------------
-        trust = self._evaluate_trust(event, guild, state)
+        actor = await self._resolve_member(guild, event.actor_id)
+        trust = self._evaluate_trust(event, guild, state, actor)
 
         # --- stage 6: detection window --------------------------------
         hit = self._window_add(event, policy)
@@ -279,7 +309,7 @@ class EventPipeline:
             cooldown_allows, escalation = await self._cooldown(event, policy, state)
 
         # --- stage 8: enforceability preflight ------------------------
-        can_enforce, blocked_reason = self._preflight_enforcement(event, guild, policy)
+        can_enforce, blocked_reason = self._preflight_enforcement(event, guild, policy, actor)
 
         # --- stage 9: policy evaluation -------------------------------
         decision = self.engine.evaluate(
@@ -293,7 +323,9 @@ class EventPipeline:
             can_enforce=can_enforce,
             enforcement_blocked_reason=blocked_reason,
         )
-        log.info(
+        # Routine no-ops (every ordinary chat message is one) stay at DEBUG.
+        log.log(
+            10 if decision.is_noop else 20,
             "policy decision",
             extra=event.as_log_context()
             | {
@@ -305,6 +337,9 @@ class EventPipeline:
         )
         if decision.is_noop:
             return PipelineResult(True, decision.code, decision=decision, detail=decision.reason)
+        if high_volume:
+            # It led somewhere, so it now belongs in the durable audit trail.
+            await self._persist_event(event)
 
         # --- stage 10: incident creation (guild-locked) ---------------
         incident_id = None
@@ -388,14 +423,42 @@ class EventPipeline:
             return False
         return self.selfguard.is_self(event.guild_id, kind, event.target_id)
 
+    def _seen_recently(self, key: str) -> bool:
+        """Bounded in-memory dedupe for high-volume events."""
+        if key in self._recent_keys:
+            return True
+        self._recent_keys[key] = None
+        if len(self._recent_keys) > RECENT_KEYS_CAPACITY:
+            self._recent_keys.popitem(last=False)
+        return False
+
+    async def _resolve_member(self, guild, user_id: int | None):  # noqa: ANN001, ANN202
+        """The actor as a member: from cache, else fetched from Discord.
+
+        The fetch matters. Shield does not chunk guilds at startup, so
+        ``get_member`` misses for anyone not yet seen on the gateway. Trust
+        evaluation on a miss would see no roles, a role-scoped allowlist entry
+        would silently not apply, and an allowlisted moderator would be
+        sanctioned. Returns ``None`` only when the user really is not a member
+        (or Discord refuses the lookup).
+        """
+        if user_id is None:
+            return None
+        member = guild.get_member(int(user_id)) if hasattr(guild, "get_member") else None
+        if member is not None:
+            return member
+        fetch = getattr(guild, "fetch_member", None)
+        if fetch is None:
+            return None
+        try:
+            return await fetch(int(user_id))
+        except Exception:  # noqa: BLE001 - left the guild, or lookup refused
+            return None
+
     def _evaluate_trust(
-        self, event: NormalizedEvent, guild, state: GuildState  # noqa: ANN001
+        self, event: NormalizedEvent, guild, state: GuildState, member=None  # noqa: ANN001
     ) -> TrustDecision:
-        role_ids: list[int] = []
-        if event.actor_id is not None and hasattr(guild, "get_member"):
-            member = guild.get_member(int(event.actor_id))
-            if member is not None:
-                role_ids = [int(r.id) for r in getattr(member, "roles", ()) or ()]
+        role_ids = [int(r.id) for r in getattr(member, "roles", ()) or ()]
         return evaluate_trust(
             action_key=event.action_key,
             actor_id=event.actor_id,
@@ -483,10 +546,11 @@ class EventPipeline:
                 now=event.monotonic,
             )
 
-        # Everything else is actor scoped (``unattributed`` when unknown).
-        actor_key = event.actor_id if event.actor_id is not None else "unattributed"
+        # Everything else is actor scoped - but only CONFIRMED attribution may
+        # count against an actor. A LIKELY guess landing in someone's window
+        # could push them over a threshold on evidence that was never theirs.
         return self.windows.add(
-            window_key(guild_id, action.value, actor_key),
+            window_key(guild_id, action.value, _actor_key(event.actor_id, event.actor_confidence)),
             threshold=policy.threshold_count,
             window_seconds=policy.window_seconds,
             now=event.monotonic,
@@ -511,7 +575,7 @@ class EventPipeline:
             return True, 0
 
     def _preflight_enforcement(
-        self, event: NormalizedEvent, guild, policy: PolicyView  # noqa: ANN001
+        self, event: NormalizedEvent, guild, policy: PolicyView, member=None  # noqa: ANN001
     ) -> tuple[bool, str | None]:
         """Cheap, synchronous feasibility check before promising enforcement."""
         from shield.enforcement.safety import (
@@ -535,12 +599,8 @@ class EventPipeline:
                 return True, None
             return False, "Shield lacks Manage Guild / Manage Channels for protective mode"
 
-        member = guild.get_member(int(event.actor_id)) if (
-            event.actor_id and hasattr(guild, "get_member")
-        ) else None
         if member is None:
-            # Could be a cache miss; the executor will try to fetch. Allow and
-            # let the executor report honestly.
+            # Not a member (any more); the executor reports that honestly.
             return True, None
 
         required = (
@@ -623,39 +683,38 @@ class EventPipeline:
     ) -> int | None:
         window_start = event.occurred_at - timedelta(seconds=hit.span_seconds)
         try:
-            async with self.db.guild_lock(event.guild_id, "incident"):
-                async with self.db.begin() as session:
-                    uow = UnitOfWork(session)
-                    incident = await uow.incidents.create(
-                        guild_id=event.guild_id,
-                        correlation_id=event.correlation_id,
-                        action_key=event.action_key,
-                        actor_id=event.actor_id,
-                        actor_confidence=event.actor_confidence,
-                        severity=decision.severity,
-                        mode_at_detection=state.guild.mode,
-                        dry_run=decision.dry_run,
-                        detected_at=event.occurred_at,
-                        window_start=window_start,
-                        event_count=hit.count,
-                        threshold_count=policy.threshold_count,
-                        window_seconds=policy.window_seconds,
-                        policy_version=state.guild.policy_version,
-                        response=decision.response,
-                        reason=decision.reason,
-                        target_type=event.target_type,
-                        target_id=event.target_id,
-                        details=_jsonable(
-                            decision.details
-                            | {
-                                "payload": event.payload,
-                                "dedupe_key": event.dedupe_key,
-                                "decision_code": decision.code,
-                                "instance_id": self.config.instance_id,
-                            }
-                        ),
-                    )
-                    return incident.id
+            async with self.db.guild_lock(event.guild_id, "incident") as session:
+                uow = UnitOfWork(session)
+                incident = await uow.incidents.create(
+                    guild_id=event.guild_id,
+                    correlation_id=event.correlation_id,
+                    action_key=event.action_key,
+                    actor_id=event.actor_id,
+                    actor_confidence=event.actor_confidence,
+                    severity=decision.severity,
+                    mode_at_detection=state.guild.mode,
+                    dry_run=decision.dry_run,
+                    detected_at=event.occurred_at,
+                    window_start=window_start,
+                    event_count=hit.count,
+                    threshold_count=policy.threshold_count,
+                    window_seconds=policy.window_seconds,
+                    policy_version=state.guild.policy_version,
+                    response=decision.response,
+                    reason=decision.reason,
+                    target_type=event.target_type,
+                    target_id=event.target_id,
+                    details=_jsonable(
+                        decision.details
+                        | {
+                            "payload": event.payload,
+                            "dedupe_key": event.dedupe_key,
+                            "decision_code": decision.code,
+                            "instance_id": self.config.instance_id,
+                        }
+                    ),
+                )
+                return incident.id
         except Exception:  # noqa: BLE001
             self.degraded_db = True
             METRICS.incr("incident_persist_errors_total")
@@ -715,11 +774,16 @@ class EventPipeline:
             policy = state.policies.get(row.action_key)
             if policy is None:
                 continue
-            actor_key = row.actor_id if row.actor_id is not None else "unattributed"
+            if row.action_key in HIGH_VOLUME_ACTIONS:
+                continue  # seconds-long windows; never rehydrated
             if row.action_key is ActionKey.JOIN_FLOOD:
                 key = window_key(guild_id, row.action_key.value)
             else:
-                key = window_key(guild_id, row.action_key.value, actor_key)
+                key = window_key(
+                    guild_id,
+                    row.action_key.value,
+                    _actor_key(row.actor_id, row.actor_confidence),
+                )
             grouped.setdefault(key, []).append(row.occurred_at)
         restored = 0
         for key, stamps in grouped.items():
@@ -757,6 +821,13 @@ class EventPipeline:
         for guild_id in self.windows.guild_ids():
             removed += self.windows.enforce_guild_cap(guild_id)
         return removed
+
+
+def _actor_key(actor_id: int | None, confidence: Confidence) -> int | str:
+    """Window scope for an administrative event's actor."""
+    if actor_id is not None and confidence is Confidence.CONFIRMED:
+        return actor_id
+    return "unattributed"
 
 
 def _jsonable(value: Any) -> Any:

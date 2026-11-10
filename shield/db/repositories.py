@@ -39,7 +39,6 @@ from shield.constants import (
     TrustScope,
 )
 from shield.db.models import (
-    AuditCursor,
     CommandAudit,
     CooldownRecord,
     EnforcementRecord,
@@ -58,6 +57,26 @@ from shield.policies.defaults import DEFAULT_POLICIES
 def _is_postgres(session: AsyncSession) -> bool:
     bind = session.get_bind()
     return bind.dialect.name == "postgresql"
+
+
+def merge_previous_state(
+    original: dict[str, Any] | None, captured: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Combine saved pre-protection state with a newer capture; the original wins.
+
+    When a protective mode is applied while one is already active, the "current"
+    values captured are the already-tightened ones. Saving those would make
+    lifting protection "restore" the raised verification level and slowmode
+    forever. So anything already recorded is kept, and the new capture only
+    contributes things not seen before (e.g. a channel created since).
+    """
+    original = dict(original or {})
+    captured = dict(captured or {})
+    merged = {**captured, **original}
+    channels = {**(captured.get("channels") or {}), **(original.get("channels") or {})}
+    if channels:
+        merged["channels"] = channels
+    return merged
 
 
 class GuildRepository:
@@ -99,16 +118,16 @@ class GuildRepository:
                 snapshot_retention=snapshot_retention,
                 snapshot_include_webhooks=snapshot_include_webhooks,
             )
-            self.session.add(settings)
             try:
-                await self.session.flush()
+                # Savepoint: losing a creation race must not poison the
+                # caller's transaction.
+                async with self.session.begin_nested():
+                    self.session.add(settings)
             except IntegrityError:
                 # Another instance created it concurrently.
-                await self.session.rollback()
                 settings = await self.session.get(GuildSettings, guild_id)
                 assert settings is not None
-            else:
-                await self.seed_policies(guild_id)
+            await self.seed_policies(guild_id)
         else:
             changed = False
             if guild_name and settings.guild_name != guild_name:
@@ -168,6 +187,29 @@ class GuildRepository:
         settings.updated_at = utcnow()
         await self.session.flush()
         return settings
+
+    async def enter_protective_mode(
+        self, guild_id: int, kind: str, captured: dict[str, Any] | None, **fields: Any
+    ) -> GuildSettings | None:
+        """Mark lockdown (``kind="lockdown"``) or raid mode (``"raid_mode"``) active.
+
+        The pre-protection state is merged, not overwritten, so re-entering a
+        mode that is already active keeps the true original values.
+        """
+        settings = await self.session.get(GuildSettings, guild_id)
+        if settings is None:
+            return None
+        already_active = bool(getattr(settings, f"{kind}_active"))
+        original = getattr(settings, f"{kind}_state") if already_active else None
+        return await self.update(
+            guild_id,
+            **{
+                f"{kind}_active": True,
+                f"{kind}_state": merge_previous_state(original, captured),
+                "protective_mode": "lockdown" if kind == "lockdown" else "raid",
+            },
+            **fields,
+        )
 
     async def bump_policy_version(self, guild_id: int) -> int:
         settings = await self.session.get(GuildSettings, guild_id)
@@ -414,9 +456,9 @@ class EventRepository:
         if existing is not None:
             return existing, False
         row = EventRecord(**values)
-        self.session.add(row)
         try:
-            await self.session.flush()
+            async with self.session.begin_nested():
+                self.session.add(row)
         except IntegrityError:
             return await self.get_by_dedupe(guild_id, dedupe_key), False
         return row, True
@@ -667,8 +709,17 @@ class IncidentRepository:
         )
         return int(result.rowcount or 0)
 
+    EXPORT_LIMIT = 5000
+
     async def export(self, guild_id: int, since: datetime) -> list[dict[str, Any]]:
-        rows = await self.list_recent(guild_id, limit=100, since=since)
+        """Newest-first incident metadata, capped at :attr:`EXPORT_LIMIT` rows."""
+        result = await self.session.execute(
+            sa.select(Incident)
+            .where(Incident.guild_id == guild_id, Incident.detected_at >= since)
+            .order_by(Incident.detected_at.desc())
+            .limit(self.EXPORT_LIMIT)
+        )
+        rows = result.scalars().all()
         return [
             {
                 "id": r.id,
@@ -749,11 +800,10 @@ class EnforcementRepository:
         if existing is not None:
             return existing, False
         row = EnforcementRecord(**values)
-        self.session.add(row)
         try:
-            await self.session.flush()
+            async with self.session.begin_nested():
+                self.session.add(row)
         except IntegrityError:
-            await self.session.rollback()
             existing = await self.get_by_key(guild_id, idempotency_key)
             assert existing is not None
             return existing, False
@@ -824,22 +874,26 @@ class CooldownRepository:
         scope is still cooling down and the caller must suppress the response.
         """
         now = utcnow()
-        row = await self.session.get(CooldownRecord, (guild_id, scope_key))
         expiry = now + timedelta(seconds=max(cooldown_seconds, 0))
+        # Row lock: two tasks seeing the same expired cooldown must not both
+        # be allowed through. (SQLite ignores FOR UPDATE and serialises writes.)
+        row = await self.session.get(
+            CooldownRecord, (guild_id, scope_key), with_for_update=True
+        )
         if row is None:
-            self.session.add(
-                CooldownRecord(
-                    guild_id=guild_id,
-                    scope_key=scope_key,
-                    expires_at=expiry,
-                    hits=1,
-                    escalation_level=0,
-                )
-            )
             try:
-                await self.session.flush()
+                async with self.session.begin_nested():
+                    self.session.add(
+                        CooldownRecord(
+                            guild_id=guild_id,
+                            scope_key=scope_key,
+                            expires_at=expiry,
+                            hits=1,
+                            escalation_level=0,
+                        )
+                    )
             except IntegrityError:
-                await self.session.rollback()
+                # Lost the race to arm it: the winner's response is in flight.
                 return False, 0
             return True, 0
 
@@ -1066,28 +1120,6 @@ class RestoreRepository:
         return result.scalars().all()
 
 
-class AuditCursorRepository:
-    def __init__(self, session: AsyncSession) -> None:
-        self.session = session
-
-    async def get(self, guild_id: int, audit_action: str) -> int:
-        row = await self.session.get(AuditCursor, (guild_id, audit_action))
-        return row.last_entry_id if row else 0
-
-    async def advance(self, guild_id: int, audit_action: str, entry_id: int) -> None:
-        row = await self.session.get(AuditCursor, (guild_id, audit_action))
-        if row is None:
-            self.session.add(
-                AuditCursor(
-                    guild_id=guild_id, audit_action=audit_action, last_entry_id=entry_id
-                )
-            )
-        elif entry_id > row.last_entry_id:
-            row.last_entry_id = entry_id
-            row.updated_at = utcnow()
-        await self.session.flush()
-
-
 class CommandAuditRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
@@ -1131,6 +1163,8 @@ class CommandAuditRepository:
 class UnitOfWork:
     """Convenience bundle of every repository over one session."""
 
+    EXPORT_LIMIT = IncidentRepository.EXPORT_LIMIT
+
     __slots__ = (
         "session",
         "guilds",
@@ -1142,7 +1176,6 @@ class UnitOfWork:
         "cooldowns",
         "snapshots",
         "restores",
-        "cursors",
         "command_audit",
     )
 
@@ -1157,5 +1190,4 @@ class UnitOfWork:
         self.cooldowns = CooldownRepository(session)
         self.snapshots = SnapshotRepository(session)
         self.restores = RestoreRepository(session)
-        self.cursors = AuditCursorRepository(session)
         self.command_audit = CommandAuditRepository(session)

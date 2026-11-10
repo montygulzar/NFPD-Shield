@@ -281,7 +281,12 @@ class IncidentsGroup(
         )
         await respond(
             interaction,
-            f"Exported **{len(rows)}** incident(s) from the last {days} day(s). "
-            "The export contains no message content and no secrets.",
+            f"Exported **{len(rows)}** incident(s) from the last {days} day(s)"
+            + (
+                " - **truncated at the export cap; narrow `days` for the rest**. "
+                if len(rows) >= UnitOfWork.EXPORT_LIMIT
+                else ". "
+            )
+            + "The export contains no message content and no secrets.",
             file=file,
         )

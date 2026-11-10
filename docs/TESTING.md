@@ -5,7 +5,7 @@ a real guild**, and the automated suite never talks to Discord at all.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # everything (301 tests, a few seconds)
+pytest                       # everything (324 tests, a few seconds)
 pytest tests/unit -q         # pure logic, no I/O
 pytest tests/integration -q  # database + wired pipeline over fakes
 pytest tests/simulation -q   # attack scenarios through the real cogs
@@ -35,6 +35,7 @@ pytest tests/simulation -q   # attack scenarios through the real cogs
 | Database URL handling (driverless upgrade, sync mapping for Alembic, TLS rules, credential encoding) | `tests/unit/test_db_urls.py`, `tests/unit/test_config.py` |
 | Health / readiness endpoints (dependency outage, gateway grace, busy port, disabled) | `tests/integration/test_health.py` |
 | Authorization (owner / delegate / operator / nobody, cross-guild) | `tests/integration/test_commands.py` |
+| Regressions from the post-merge audit (uncached-member trust, LIKELY attribution in windows, kick misclassification, protective-state overwrite, message persistence, guild-join crash, approved guilds) | `tests/integration/test_regressions.py`, `tests/integration/test_postgres.py` |
 | Self-action suppression | `test_pipeline.py::test_shields_own_actions_do_not_trigger_itself`, `test_attack_scenarios.py::test_restoration_burst_does_not_trigger_self_protection` |
 
 ## 2. The Discord fakes
