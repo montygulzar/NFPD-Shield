@@ -256,10 +256,34 @@ accepts `json` (one object per line, for an aggregator) or `text`/`console`.
 
 ## Running both bots side by side
 
-Two things to settle before an incident, not during one:
+### Link the mod bot first
 
-**1. The mod bot will trip Shield.** It is a separate bot user, so Shield's
-self-exemption does not cover it. `/restorebackup` recreating roles and channels
+When a moderator bans or kicks through the mod bot, Discord's audit log names
+**the bot**. Unlinked, Shield pools every moderator's actions into the bot's
+rate window, blames the bot for a rogue moderator's mass ban, and cannot contain
+anything (a bot's integration role is not removable). Link them once per guild:
+
+```
+/shield whitelist add user:@NFPD-Mod-Bot scope:moderation_proxy reason:"mod bot"
+```
+
+Shield then reads the moderator from the audit reason the mod bot already
+writes (`Ban by name (id): reason`) and applies the normal thresholds to **that
+moderator**. One moderator banning twice in 15 seconds trips `mass_ban`; two
+moderators banning once each do not. The mod bot needs no change.
+
+- The scope grants the bot **no exemption**; it only redirects attribution.
+- It can only be given to a bot account. A person can type any audit reason, so
+  a human proxy could frame someone.
+- The mod bot's automatic actions (warn-threshold bans) name no moderator.
+  Shield may alert on those but sanctions nobody.
+- The guild owner and allowlisted moderators stay exempt when acting through
+  the bot, exactly as when acting directly.
+
+Two more things to settle before an incident, not during one:
+
+**1. The mod bot's own structural work can still trip Shield.** The proxy link
+covers moderator-issued actions; `/restorebackup` recreating roles and channels
 crosses `role_create_flood` and `channel_create_flood`; its guild edits cross
 `guild_settings_change`. Options, in increasing order of how much protection you
 give up:

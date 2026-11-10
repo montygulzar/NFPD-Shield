@@ -159,6 +159,10 @@ class TrustScope(str, enum.Enum):
     #: Command authority only. Grants NO detection exemption whatsoever - it
     #: lets a delegate configure Shield, not bypass it.
     MANAGE_SHIELD = "manage_shield"
+    #: Marks a moderation BOT whose actions are really a human moderator's. It
+    #: grants no exemption: Shield reads the moderator out of the bot's audit
+    #: reason and holds that person to the normal policies instead of the bot.
+    MODERATION_PROXY = "moderation_proxy"
     WEBHOOKS = "webhooks"
     MESSAGES = "messages"
     BOTS = "bots"
@@ -170,6 +174,8 @@ SCOPE_ACTIONS: dict[TrustScope, frozenset[ActionKey]] = {
     TrustScope.ALL: frozenset(ActionKey),
     # Deliberately empty: an administrative delegate is still policed.
     TrustScope.MANAGE_SHIELD: frozenset(),
+    # Deliberately empty: the moderator behind the bot is policed in its place.
+    TrustScope.MODERATION_PROXY: frozenset(),
     TrustScope.DESTRUCTIVE: frozenset(
         {
             ActionKey.MASS_BAN,

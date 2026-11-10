@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from shield.audit.correlator import AuditCorrelator
+from shield.audit.proxy import parse_moderator_id, proxy_bot_ids
 from shield.constants import (
     AUDIT_CORRELATED_ACTIONS,
     ActionKey,
@@ -285,7 +286,22 @@ class EventPipeline:
                 event.payload["audit_degraded"] = True
             if attribution.actor_id and self.selfguard.bot_user_id == attribution.actor_id:
                 event.self_inflicted = True
+            self._resolve_proxy(event, guild, state)
             if event_row_id is not None:
+                await self._safe_db(
+                    lambda s: UnitOfWork(s).events.attach_attribution(
+                        event_row_id,
+                        guild_id=event.guild_id,
+                        actor_id=event.actor_id,
+                        confidence=event.actor_confidence,
+                        audit_entry_id=event.audit_entry_id,
+                    )
+                )
+
+        elif event.action_key in AUDIT_CORRELATED_ACTIONS and not event.self_inflicted:
+            # Arrived already attributed (kicks, webhooks): still see through a
+            # proxy bot, and record the result.
+            if self._resolve_proxy(event, guild, state) and event_row_id is not None:
                 await self._safe_db(
                     lambda s: UnitOfWork(s).events.attach_attribution(
                         event_row_id,
@@ -422,6 +438,43 @@ class EventPipeline:
         if kind is None:
             return False
         return self.selfguard.is_self(event.guild_id, kind, event.target_id)
+
+    def _resolve_proxy(self, event: NormalizedEvent, guild, state: GuildState) -> bool:  # noqa: ANN001
+        """Replace a moderation-proxy bot with the moderator who used it.
+
+        Returns True when the event's attribution changed. See
+        :mod:`shield.audit.proxy` for why the audit reason is trusted here.
+        """
+        bot_id = event.actor_id
+        if bot_id is None or event.actor_confidence is not Confidence.CONFIRMED:
+            return False
+        if bot_id not in proxy_bot_ids(state.trust_entries):
+            return False
+        member = guild.get_member(int(bot_id)) if hasattr(guild, "get_member") else None
+        if member is not None and not getattr(member, "bot", False):
+            # Only a bot's reason text is machine-written. Never trust a human's.
+            return False
+
+        reason = (event.payload.get("audit_changes") or {}).get("reason")
+        moderator_id = parse_moderator_id(reason)
+        event.payload["via_proxy_bot"] = bot_id
+        if moderator_id is None or moderator_id == bot_id:
+            # The bot acted with no moderator named (e.g. an automatic action).
+            # Nobody can be held responsible, so this may alert but never sanction.
+            event.actor_confidence = Confidence.LIKELY
+            event.payload["proxy_unresolved"] = True
+            event.payload["attribution_reason"] = (
+                "performed by a moderation proxy bot with no moderator named in the "
+                "audit reason; nobody is sanctioned"
+            )
+            return True
+        event.actor_id = moderator_id
+        event.payload["attribution_reason"] = (
+            f"moderator {moderator_id} acting through proxy bot {bot_id} "
+            "(read from the bot's audit reason)"
+        )
+        METRICS.incr("proxy_resolved_total", action=event.action_key.value)
+        return True
 
     def _seen_recently(self, key: str) -> bool:
         """Bounded in-memory dedupe for high-volume events."""
