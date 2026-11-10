@@ -385,12 +385,9 @@ class ShieldCommands(
             )
             async with bot.db.begin() as session:
                 uow = UnitOfWork(session)
-                await uow.guilds.update(
-                    guild.id,
-                    lockdown_active=True,
-                    lockdown_state=result.previous_state,
+                await uow.guilds.enter_protective_mode(
+                    guild.id, "lockdown", result.previous_state,
                     lockdown_reason=f"mode lockdown by {interaction.user.id}",
-                    protective_mode="lockdown",
                 )
             extra = f"\n{result.summary()}"
         await respond(interaction, f"Mode set to `{target.value}`.{extra}")

@@ -174,3 +174,68 @@ async def test_advisory_locks_do_not_block_other_guilds(pg):  # noqa: ANN001
 
 async def test_try_lock_probe(pg):  # noqa: ANN001
     assert await pg.try_guild_lock(GUILD, "snapshot") is True
+
+
+async def test_guild_lock_does_not_exhaust_a_small_pool():
+    """The lock used to be taken on one connection and the work done on another.
+
+    Under a burst every waiter pinned a connection while the holder waited for a
+    free one: with more waiters than pool slots, incident creation deadlocked
+    until the pool timeout. The lock now yields the session that holds it.
+    """
+    import dataclasses
+
+    small = Database(dataclasses.replace(pg_config(), pool_size=2, max_overflow=0, pool_timeout=5))
+    done: list[int] = []
+
+    async def worker(n: int) -> None:
+        async with small.guild_lock(GUILD + 5, "incident") as session:
+            await session.execute(__import__("sqlalchemy").text("SELECT 1"))
+            await asyncio.sleep(0.02)
+            done.append(n)
+
+    try:
+        await asyncio.wait_for(asyncio.gather(*(worker(n) for n in range(8))), timeout=10)
+    finally:
+        await small.dispose()
+    assert sorted(done) == list(range(8))
+
+
+async def test_concurrent_cooldown_checks_admit_exactly_one(pg):  # noqa: ANN001
+    """Two tasks racing on a fresh or expired cooldown must not both respond."""
+    for label, seconds in (("fresh", 60), ("expired", 60)):
+        scope = f"race-{label}"
+        if label == "expired":
+            async with pg.begin() as session:
+                await UnitOfWork(session).cooldowns.check_and_set(GUILD, scope, 0)
+        async def check(scope: str = scope, seconds: int = seconds) -> bool:
+            async with pg.begin() as session:
+                allowed, _ = await UnitOfWork(session).cooldowns.check_and_set(
+                    GUILD, scope, seconds
+                )
+                return allowed
+
+        outcomes = list(await asyncio.gather(*(check() for _ in range(6))))
+        assert outcomes.count(True) == 1, f"{label}: {outcomes}"
+
+
+async def test_losing_a_creation_race_does_not_poison_the_transaction(pg):  # noqa: ANN001
+    """A lost insert race used to call rollback() inside a managed transaction."""
+    guild_id = GUILD + 9
+
+    async def ensure() -> None:
+        async with pg.begin() as session:
+            uow = UnitOfWork(session)
+            await uow.guilds.ensure(guild_id, guild_name="race")
+            # The transaction must still be usable afterwards.
+            assert await uow.policies.get(guild_id, ActionKey.MASS_BAN) is not None
+
+    try:
+        await asyncio.gather(*(ensure() for _ in range(5)))
+    finally:
+        import sqlalchemy as sa
+
+        from shield.db.models import GuildSettings
+
+        async with pg.begin() as session:
+            await session.execute(sa.delete(GuildSettings).where(GuildSettings.guild_id == guild_id))

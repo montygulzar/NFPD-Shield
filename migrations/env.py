@@ -24,29 +24,13 @@ from sqlalchemy import engine_from_config, pool
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from shield.db.models import Base  # noqa: E402
+from shield.db.urls import to_sync_url  # noqa: E402
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
-
-#: async driver -> sync driver, so one DATABASE_URL serves both.
-_SYNC_REPLACEMENTS = {
-    "postgresql+asyncpg": "postgresql+psycopg2",
-    "postgres+asyncpg": "postgresql+psycopg2",
-    "sqlite+aiosqlite": "sqlite",
-}
-
-
-def _to_sync(url: str) -> str:
-    for async_driver, sync_driver in _SYNC_REPLACEMENTS.items():
-        if url.startswith(async_driver + "://"):
-            converted = url.replace(async_driver, sync_driver, 1)
-            # asyncpg uses ?ssl=require; psycopg2 wants ?sslmode=require
-            return converted.replace("?ssl=", "?sslmode=").replace("&ssl=", "&sslmode=")
-    return url
-
 
 def resolve_url() -> str:
     cli = context.get_x_argument(as_dictionary=True).get("url")
@@ -56,7 +40,7 @@ def resolve_url() -> str:
             "No database URL. Set DATABASE_URL in the environment, or pass "
             "-x url=postgresql+asyncpg://user:pass@host:5432/dbname"
         )
-    return _to_sync(url)
+    return to_sync_url(url)
 
 
 def run_migrations_offline() -> None:

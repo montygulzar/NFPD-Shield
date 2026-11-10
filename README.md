@@ -160,14 +160,37 @@ Key invariants:
 - **Shield's own writes cannot trigger Shield.** Every write registers with a
   self-action guard first, so a 40-channel restore is not read as a creation
   flood.
+- **Only confirmed attribution counts against an actor.** A `LIKELY` guess is
+  windowed as unattributed, so it can never push someone over a threshold.
+- **Chat traffic costs the database nothing.** Per-message events are
+  deduplicated in memory and written only when they lead to an incident.
 - **Windows use `time.monotonic()`**; persistence uses UTC. An NTP correction
   cannot widen or collapse a rate window.
 
 ## Quick start
 
+Two supported deployments, one environment contract.
+
+**Docker**, alongside the other NFPD bots on a shared `nfpd-postgres` container:
+
 ```bash
 git clone https://github.com/montygulzar/NFPD-Shield.git
 cd NFPD-Shield
+cp .env.example .env && chmod 600 .env
+nano .env                          # DISCORD_TOKEN, APPLICATION_ID, OWNERID, DATABASE_URL
+GIT_COMMIT="$(git rev-parse --short HEAD)" docker compose build
+docker compose up -d && docker compose logs -f
+```
+
+Shield needs **its own database** on that PostgreSQL server (default
+`nfpd_shield`), not the mod bot's — both define a `guild_settings` table with
+different columns, and sharing one breaks both. The full rationale, the SQL to
+create the role and database, and the side-by-side notes are in
+[`docs/DOCKER.md`](docs/DOCKER.md).
+
+**systemd**, on a standalone VPS:
+
+```bash
 sudo ./deploy/install.sh          # creates the user, venv, database and unit
 sudoedit /etc/nfpd-shield/shield.env   # fill in DISCORD_TOKEN, APPLICATION_ID, OWNERID, DATABASE_URL
 sudo ./deploy/install.sh --migrate-only
@@ -232,13 +255,21 @@ is currently out of reach.
 All secrets and deployment IDs come from the process environment; nothing is
 hard coded and no ID is committed. `.env.example` is the full contract.
 
-- `OWNERID` is the canonical global operator variable (`OWNER_ID` and
-  `SHIELD_OWNER_ID` are accepted aliases). The operator gets **diagnostics
+- `OWNERID` is the canonical global operator variable (`OWNER_ID`,
+  `SHIELD_OWNER_ID` and the plural `OWNER_IDS` list are accepted). The operator gets **diagnostics
   scope only** — it is not exempt from any guild's protections and cannot
   change a guild's protection state.
 - Per-guild settings (mode, thresholds, allowlist, log channel, snapshot
   cadence) live in PostgreSQL. Environment values are only bootstrap defaults
   applied the first time Shield sees a guild.
+- `DATABASE_URL` takes a plain `postgresql://` URL (the driver is added
+  automatically) or the discrete `POSTGRES_USER`/`PASSWORD`/`HOST`/`PORT`/`DB`
+  form. TLS is required for routable hosts and not for loopback, a Unix socket
+  or a single-label container name; `DB_REQUIRE_TLS` overrides that judgement.
+- `APPROVED_GUILD_IDS` restricts Shield to the listed servers: anywhere else it
+  ignores events and refuses commands, and with `LEAVE_UNAPPROVED_GUILDS=true`
+  it leaves. Shield holds Manage Roles and Manage Guild; it should not sit armed
+  in a server nobody approved.
 - Boot validation lists **every** problem at once and exits `78` (`EX_CONFIG`)
   without starting. It rejects placeholder tokens, non-numeric snowflakes,
   synchronous database drivers, remote databases without TLS, and contradictory
@@ -305,8 +336,8 @@ positives. Do not skip this.
 5. **Watch for at least several days of normal traffic.** Use
    `/shield incidents list` and mark noise with
    `/shield incidents acknowledge false_positive:true`.
-6. **Tune.** Raise thresholds, widen windows, add `exempt_channel_ids` for busy
-   channels, allowlist your legitimate automation with the narrowest scope that
+6. **Tune.** Raise thresholds, widen windows, exempt busy channels
+   (`/shield thresholds set action:message_spam exempt_channel:#bots`), allowlist your legitimate automation with the narrowest scope that
    works. Aim for a 7-day false-positive rate of zero before enforcing.
 7. **Enforce one detector at a time:** set its response while leaving
    `dry_run: true` for the rest of the guild, then flip
@@ -338,9 +369,25 @@ token. Only the guild owner can apply it, a pre-restore snapshot is taken
 first, the plan is recomputed against current state, and the result records
 old → new ID mapping plus precisely what was and was not restored.
 
+## Health endpoints
+
+Shield serves two read-only HTTP routes for container orchestration and
+monitoring, matching the contract the other NFPD services expose:
+
+| Route | Meaning | Codes |
+|---|---|---|
+| `GET /health` | Liveness: the process is up and its event loop is scheduling work. Stays 200 while dependencies are down, because a restart would not fix a database outage. | 200 |
+| `GET /ready` | Readiness: logged into Discord **and** PostgreSQL reachable. Tolerates a 90s gateway drop, since discord.py resumes on its own. | 200 / 503 |
+
+Neither is published to the host by the compose file, neither exposes guild
+data, configuration or secrets, and Shield has no state-changing HTTP route at
+all — everything that changes behaviour goes through a slash command with
+server-side authorization. Disable with `HEALTH_SERVER_ENABLED=false`.
+
 ## Operations
 
 ```bash
+docker compose ps && docker compose logs -f        # Docker deployment
 systemctl status nfpd-shield
 journalctl -u nfpd-shield -f                        # structured JSON, one object per line
 journalctl -u nfpd-shield -p warning --since '1 hour ago'
@@ -383,6 +430,7 @@ restoration, rate limits, database outage and restart recovery.
 |---|---|
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | pipeline, data model, audit correlation, concurrency, phased plan |
 | [`docs/THREAT_MATRIX.md`](docs/THREAT_MATRIX.md) | threats, detection, response, residual risk |
+| [`docs/DOCKER.md`](docs/DOCKER.md) | Docker deployment beside the other NFPD bots, database separation, running both |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | exact VPS commands, systemd, rollback |
 | [`docs/RUNBOOKS.md`](docs/RUNBOOKS.md) | incident runbooks |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | security review and deployment checklist |

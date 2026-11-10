@@ -110,30 +110,34 @@ class Database:
 
     # -- per-guild coordination ---------------------------------------
     @contextlib.asynccontextmanager
-    async def guild_lock(self, guild_id: int, purpose: str = "incident") -> AsyncIterator[bool]:
+    async def guild_lock(
+        self, guild_id: int, purpose: str = "incident"
+    ) -> AsyncIterator[AsyncSession]:
         """Serialise work for one guild across processes and shards.
 
-        On PostgreSQL this is a transaction-scoped advisory lock, so multiple
-        Shield instances never create duplicate incidents or race a restore.
+        Yields the **session that holds the lock**; do the guarded work on it.
+        On PostgreSQL the lock is a transaction-scoped advisory lock on that
+        session's own connection, so the guarded work needs no second
+        connection. (Taking the lock on one connection and working on another
+        deadlocks the pool under a burst: every waiter pins a connection while
+        the holder waits for a free one.) The transaction commits, releasing
+        the lock, when the block exits.
+
         On SQLite (tests) it degrades to a process-local asyncio lock, which is
         why multi-process deployments require PostgreSQL.
-
-        Yields ``True`` when the lock was obtained.
         """
         if self._cfg.is_sqlite:
-            key = (guild_id, purpose)
-            lock = _LOCAL_LOCKS.setdefault(key, asyncio.Lock())
-            async with lock:
-                yield True
+            lock = _LOCAL_LOCKS.setdefault((guild_id, purpose), asyncio.Lock())
+            async with lock, self.begin() as session:
+                yield session
             return
 
-        key2 = _purpose_key(purpose)
-        async with self._engine.begin() as conn:
-            await conn.execute(
+        async with self.begin() as session:
+            await session.execute(
                 sa.text("SELECT pg_advisory_xact_lock(:a, :b)"),
-                {"a": _signed32(guild_id ^ ADVISORY_NAMESPACE), "b": key2},
+                {"a": _signed32(guild_id ^ ADVISORY_NAMESPACE), "b": _purpose_key(purpose)},
             )
-            yield True
+            yield session
 
     async def try_guild_lock(self, guild_id: int, purpose: str = "incident") -> bool:
         """Non-blocking advisory lock probe (session scoped, PostgreSQL only)."""

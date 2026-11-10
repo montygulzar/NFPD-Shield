@@ -76,9 +76,26 @@ def test_invalid_snowflakes_are_rejected(value: str):
     assert any("APPLICATION_ID" in e for e in errors_for(APPLICATION_ID=value))
 
 
-def test_sync_driver_is_rejected_with_actionable_message():
-    found = errors_for(DATABASE_URL="postgresql://u:p@127.0.0.1:5432/db")
-    assert any("asyncpg" in e for e in found)
+def test_driverless_postgres_url_is_upgraded_to_asyncpg():
+    """The rest of the stack writes plain postgresql:// - accept and upgrade it."""
+    config = load(DATABASE_URL="postgresql://nfpd_shield:pw@nfpd-postgres:5432/nfpd_shield")
+    assert config.database.url.startswith("postgresql+asyncpg://")
+    assert config.database.url.endswith("@nfpd-postgres:5432/nfpd_shield")
+
+
+def test_postgres_scheme_alias_is_upgraded_too():
+    assert load(
+        DATABASE_URL="postgres://u:p@nfpd-postgres:5432/db"
+    ).database.url.startswith("postgresql+asyncpg://")
+
+
+def test_an_actual_sync_driver_is_rejected():
+    found = errors_for(DATABASE_URL="postgresql+psycopg2://u:p@127.0.0.1:5432/db")
+    assert any("async" in e for e in found)
+
+
+def test_non_postgres_scheme_is_rejected():
+    assert any("unsupported" in e for e in errors_for(DATABASE_URL="mysql://u:p@host/db"))
 
 
 def test_remote_database_requires_tls():
@@ -89,6 +106,105 @@ def test_remote_database_requires_tls():
 def test_remote_database_with_ssl_is_accepted():
     config = load(DATABASE_URL="postgresql+asyncpg://u:p@db.example.com:5432/db?ssl=require")
     assert config.database.requires_tls and config.database.tls_configured
+
+
+def test_single_label_container_host_does_not_require_tls():
+    """`nfpd-postgres` is a Docker DNS name on a private bridge, not a routable host."""
+    config = load(DATABASE_URL="postgresql://u:p@nfpd-postgres:5432/db")
+    assert config.database.requires_tls is False
+    assert config.database.tls_configured is False
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "0.0.0.0"])
+def test_loopback_hosts_do_not_require_tls(host: str):
+    assert load(DATABASE_URL=f"postgresql://u:p@{host}:5432/db").database.requires_tls is False
+
+
+def test_db_require_tls_can_force_tls_on_a_container_host():
+    found = errors_for(
+        DATABASE_URL="postgresql://u:p@nfpd-postgres:5432/db", DB_REQUIRE_TLS="true"
+    )
+    assert any("without TLS" in e for e in found)
+
+
+def test_db_require_tls_can_waive_tls_for_a_private_hop():
+    config = load(
+        DATABASE_URL="postgresql://u:p@db.internal.example.com:5432/db", DB_REQUIRE_TLS="false"
+    )
+    assert config.database.requires_tls is False
+
+
+def test_discrete_postgres_variables_assemble_a_url():
+    config = load_config(
+        {
+            "DISCORD_TOKEN": FAKE_DISCORD_TOKEN,
+            "APPLICATION_ID": "123456789012345678",
+            "OWNERID": "123456789012345679",
+            "POSTGRES_USER": "nfpd_shield",
+            "POSTGRES_PASSWORD": "pw",
+            "POSTGRES_HOST": "nfpd-postgres",
+            "POSTGRES_DB": "nfpd_shield",
+        },
+        allow_dotenv=False,
+    )
+    assert config.database.url == (
+        "postgresql+asyncpg://nfpd_shield:pw@nfpd-postgres:5432/nfpd_shield"
+    )
+
+
+def test_discrete_credentials_are_percent_encoded():
+    """An unescaped @ or / in a password silently points the URL elsewhere."""
+    config = load_config(
+        {
+            "DISCORD_TOKEN": FAKE_DISCORD_TOKEN,
+            "APPLICATION_ID": "123456789012345678",
+            "OWNERID": "123456789012345679",
+            "POSTGRES_USER": "nfpd_shield",
+            "POSTGRES_PASSWORD": "p@ss/w0rd:x",
+            "POSTGRES_HOST": "nfpd-postgres",
+            "POSTGRES_DB": "nfpd_shield",
+        },
+        allow_dotenv=False,
+    )
+    assert "p%40ss%2Fw0rd%3Ax" in config.database.url
+    assert "@nfpd-postgres:5432/nfpd_shield" in config.database.url
+
+
+def test_explicit_database_url_wins_over_discrete_variables():
+    config = load(
+        DATABASE_URL="postgresql://explicit:pw@nfpd-postgres:5432/explicit_db",
+        POSTGRES_USER="ignored",
+        POSTGRES_PASSWORD="ignored",
+        POSTGRES_HOST="ignored-host",
+        POSTGRES_DB="ignored_db",
+    )
+    assert "explicit_db" in config.database.url
+    assert "ignored" not in config.database.url
+
+
+def test_incomplete_discrete_variables_are_reported_as_missing():
+    env = dict(GOOD)
+    del env["DATABASE_URL"]
+    env.update({"POSTGRES_USER": "u", "POSTGRES_HOST": "h"})  # no password, no db
+    with pytest.raises(ConfigError) as info:
+        load_config(env, allow_dotenv=False)
+    assert any("POSTGRES_USER" in e for e in info.value.errors)
+
+
+def test_health_server_defaults():
+    config = load()
+    assert config.health_server_enabled is True
+    assert (config.health_host, config.health_port) == ("0.0.0.0", 8080)
+
+
+def test_health_port_is_range_checked():
+    assert any("HEALTH_PORT" in e for e in errors_for(HEALTH_PORT="70000"))
+
+
+def test_build_metadata_defaults_and_overrides():
+    assert (load().app_version, load().git_commit) == ("dev", "unknown")
+    config = load(APP_VERSION="1.4.2", GIT_COMMIT="abc1234")
+    assert (config.app_version, config.git_commit) == ("1.4.2", "abc1234")
 
 
 def test_database_url_missing_dbname_is_rejected():
@@ -180,3 +296,38 @@ def test_dotenv_parser_is_systemd_compatible(tmp_path, monkeypatch):
     assert values["EXPORTED"] == "exported"
     assert values["NOT_EXPANDED"] == "$HOME/literal"  # no shell expansion
     assert values["EMPTY"] == ""
+
+
+def test_owner_ids_plural_form_is_accepted():
+    """The other NFPD services write OWNER_IDS; a shared .env must not fail boot."""
+    env = dict(GOOD)
+    del env["OWNERID"]
+    env["OWNER_IDS"] = "123456789012345679, 223456789012345679"
+    config = load_config(env, allow_dotenv=False)
+    assert config.owner_id == 123456789012345679
+    assert config.is_operator(223456789012345679)
+
+
+def test_ownerid_wins_and_owner_ids_become_operators():
+    config = load(OWNER_IDS="223456789012345679")
+    assert config.owner_id == 123456789012345679
+    assert config.is_operator(223456789012345679)
+
+
+def test_log_format_text_is_the_console_format():
+    assert load(LOG_FORMAT="text").logging.fmt == "console"
+
+
+def test_approved_guilds_default_to_everywhere():
+    config = load()
+    assert config.approved_guild_ids == () and config.guild_approved(42)
+
+
+def test_approved_guilds_restrict_operation():
+    config = load(APPROVED_GUILD_IDS="123456789012345670")
+    assert config.guild_approved(123456789012345670)
+    assert not config.guild_approved(123456789012345671)
+
+
+def test_leaving_unapproved_guilds_requires_an_approved_list():
+    assert any("contradictory" in e for e in errors_for(LEAVE_UNAPPROVED_GUILDS="true"))

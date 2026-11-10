@@ -597,12 +597,9 @@ class ResponseExecutor:
         )
         async with self.db.begin() as session:
             uow = UnitOfWork(session)
-            await uow.guilds.update(
-                guild.id,
-                lockdown_active=True,
+            await uow.guilds.enter_protective_mode(
+                guild.id, "lockdown", result.previous_state,
                 lockdown_reason=f"incident {incident_id}: {event.action_key.value}",
-                lockdown_state=result.previous_state,
-                protective_mode="lockdown",
             )
         status = (
             EnforcementStatus.SUCCEEDED
@@ -646,12 +643,8 @@ class ResponseExecutor:
         )
         async with self.db.begin() as session:
             uow = UnitOfWork(session)
-            await uow.guilds.update(
-                guild.id,
-                raid_mode_active=True,
-                raid_mode_until=until,
-                raid_mode_state=result.previous_state,
-                protective_mode="raid",
+            await uow.guilds.enter_protective_mode(
+                guild.id, "raid_mode", result.previous_state, raid_mode_until=until
             )
         status = (
             EnforcementStatus.SUCCEEDED

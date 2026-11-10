@@ -429,6 +429,7 @@ async def test_t6_raid_mode_expires_and_restores_settings(harness, cogs, shield_
     bot.notifier = harness.notifier
     bot.pipeline = harness.pipeline
     bot._fake_guilds = [guild]
+    bot._maintenance_ticks = 0
     report = await bot.maintenance_tick()
 
     assert report["raid_modes_expired"] == 1

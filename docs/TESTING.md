@@ -5,7 +5,7 @@ a real guild**, and the automated suite never talks to Discord at all.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # everything (253 tests, a few seconds)
+pytest                       # everything (324 tests, a few seconds)
 pytest tests/unit -q         # pure logic, no I/O
 pytest tests/integration -q  # database + wired pipeline over fakes
 pytest tests/simulation -q   # attack scenarios through the real cogs
@@ -32,7 +32,10 @@ pytest tests/simulation -q   # attack scenarios through the real cogs
 | Idempotency (claim races, replayed decisions) | `test_repositories.py::test_enforcement_claim_is_idempotent`, `::test_concurrent_claims_only_one_wins` |
 | Config validation / boot failure | `tests/unit/test_config.py` |
 | Secret redaction | `tests/unit/test_misc_units.py` |
+| Database URL handling (driverless upgrade, sync mapping for Alembic, TLS rules, credential encoding) | `tests/unit/test_db_urls.py`, `tests/unit/test_config.py` |
+| Health / readiness endpoints (dependency outage, gateway grace, busy port, disabled) | `tests/integration/test_health.py` |
 | Authorization (owner / delegate / operator / nobody, cross-guild) | `tests/integration/test_commands.py` |
+| Regressions from the post-merge audit (uncached-member trust, LIKELY attribution in windows, kick misclassification, protective-state overwrite, message persistence, guild-join crash, approved guilds) | `tests/integration/test_regressions.py`, `tests/integration/test_postgres.py` |
 | Self-action suppression | `test_pipeline.py::test_shields_own_actions_do_not_trigger_itself`, `test_attack_scenarios.py::test_restoration_burst_does_not_trigger_self_protection` |
 
 ## 2. The Discord fakes
@@ -180,5 +183,6 @@ upgrade first.
 | Real Discord API semantics (exact audit timing, rate-limit buckets, `invites_disabled` availability) | cannot be faithfully faked | staging plan above |
 | Privileged intent approval | a Discord process | manual |
 | systemd hardening | needs a host | `systemd-analyze verify`, then staging deploy |
+| Container runtime behaviour (restart policy, healthcheck interval, read-only rootfs) | needs a Docker daemon | CI builds the image and asserts the uid, entrypoint failure modes and probe; the rest is verified on the staging host |
 | Multi-process window sharing | a documented limitation, not a feature | documented in `docs/DEPLOYMENT.md` §13 |
 | Icon/banner restoration | not restorable from a URL | documented as unsupported |

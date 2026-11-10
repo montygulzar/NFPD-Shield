@@ -116,6 +116,14 @@ async def authorize(
         await _record(interaction, command, result, parameters, correlation_id, guild_id=None)
         return result
 
+    config = getattr(interaction.client, "shield_config", None)
+    if config is not None and not config.guild_approved(guild.id):
+        result = AuthResult(
+            Authority.NONE, False, "This server is not approved to use NFPD Shield."
+        )
+        await _record(interaction, command, result, parameters, correlation_id, guild_id=guild.id)
+        return result
+
     authority = await resolve_authority(interaction)
     allowed = authority >= required
 

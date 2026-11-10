@@ -122,6 +122,8 @@ the Discord API, it is listed as unsupported rather than silently omitted.
 | Snowflake, URL, TLS, boolean, range and contradiction checks | yes | A | |
 | systemd `EnvironmentFile` compatibility | yes | S | documented differences from python-dotenv |
 | Per-guild settings in PostgreSQL | yes | A | env values are bootstrap defaults only |
+| Per-channel exemptions for message detectors | yes | A | `/shield thresholds set ... exempt_channel:` |
+| Approved-guild restriction (`APPROVED_GUILD_IDS`, optional auto-leave) | yes | A | events ignored and commands refused elsewhere |
 | Alembic migrations, up and down | yes | A+S | round-trip verified |
 | Default policy seeding, idempotent | yes | A | |
 | Connection pooling, pre-ping, recycling | yes | — | |
@@ -135,6 +137,11 @@ the Discord API, it is listed as unsupported rather than silently omitted.
 | Rotating file sink (optional) | yes | — | journal-only by default |
 | In-process metrics | yes | A | no Prometheus exporter (roadmap) |
 | Slash-command surface (31 commands) | yes | A | guild-only, ephemeral |
+| `/health` + `/ready` HTTP endpoints | yes | A | read-only, not published to the host, no state-changing route exists |
+| Docker image + compose service | yes | A (CI builds it) | multi-stage, tini, non-root uid 10002, read-only rootfs, caps dropped |
+| Container entrypoint: wait for PostgreSQL, migrate, exec | yes | A (shell) + S | distinct exit codes for invalid config (78) and connectivity timeout (1) |
+| Driverless `postgresql://` DSN and discrete `POSTGRES_*` form | yes | A | one DSN spelling shared with the rest of the NFPD stack |
+| TLS required for routable hosts only, with `DB_REQUIRE_TLS` override | yes | A | a single-label container name is not treated as remote |
 | Server-side authority ladder | yes | A | owner > delegate > operator > none |
 | Command auditing of allowed and denied attempts | yes | A | |
 | Health check (intents, permissions, hierarchy, database, audit log) | yes | A | |
@@ -145,7 +152,8 @@ the Discord API, it is listed as unsupported rather than silently omitted.
 | Installer, rollback and backup scripts | yes | S | idempotent; syntax-checked in CI |
 | Multi-process / sharded operation | yes | A (locks) | caveat: per-process detection windows |
 | Web dashboard | **unsupported** | — | out of scope by requirement: slash commands only |
-| Prometheus / OpenTelemetry export | **unsupported** | — | roadmap phase 7 |
+| Prometheus / OpenTelemetry export | **unsupported** | — | roadmap phase 7; `/health` and `/ready` cover orchestration today |
+| Bot-to-bot HTTP API (as the mod bot's `POST /internal/unban`) | **unsupported** | — | deliberate: Shield exposes no state-changing HTTP route. Everything that changes behaviour goes through a slash command with server-side authorization |
 | In-Discord false-positive review queue | **unsupported** | — | manual via `/shield incidents acknowledge` |
 | Cross-guild attacker reputation sharing | **unsupported** | — | deliberate: it would leak guild-specific data |
 
@@ -153,7 +161,7 @@ the Discord API, it is listed as unsupported rather than silently omitted.
 
 | Layer | Count | Scope |
 |---|---|---|
-| `tests/unit` | 120 | config validation, windows, trust, policy engine, hierarchy safety, audit correlation, rate limits, self-guard, redaction, dedupe keys, snapshot serialisation |
-| `tests/integration` | 110 | repositories and isolation, the wired pipeline, backup/restore, slash commands and authorization, PostgreSQL-specific paths (5, skipped without a server) |
+| `tests/unit` | 163 | config validation, windows, trust, policy engine, hierarchy safety, audit correlation, rate limits, self-guard, redaction, dedupe keys, snapshot serialisation |
+| `tests/integration` | 141 | repositories and isolation, the wired pipeline, backup/restore, slash commands and authorization, PostgreSQL-specific paths (8, skipped without a server) |
 | `tests/simulation` | 28 | end-to-end attack scenarios through the real gateway cogs, mapped to the threat matrix |
-| **Total** | **258** (253 run anywhere + 5 PostgreSQL-conditional) | the Discord API is always faked; no destructive action is ever taken against a real guild |
+| **Total** | **332** (324 run anywhere + 8 PostgreSQL-conditional) | the Discord API is always faked; no destructive action is ever taken against a real guild |

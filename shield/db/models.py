@@ -140,7 +140,6 @@ class GuildSettings(TimestampMixin, Base):
     )
 
     incident_cooldown_seconds: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=60)
-    min_account_age_hours: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
 
     enabled_by: Mapped[int | None] = mapped_column(sa.BigInteger)
     enabled_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
@@ -412,19 +411,6 @@ class RestoreJob(TimestampMixin, Base):
     )
 
 
-class AuditCursor(Base):
-    """Highest audit-log entry ID already consumed per guild + action."""
-
-    __tablename__ = "audit_cursors"
-
-    guild_id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=False)
-    audit_action: Mapped[str] = mapped_column(sa.String(64), primary_key=True)
-    last_entry_id: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, default=0)
-    updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime, nullable=False, default=utcnow, server_default=sa.func.now()
-    )
-
-
 class CommandAudit(Base):
     """Every privileged slash-command invocation, allowed or denied."""
 
@@ -475,7 +461,6 @@ ALL_TABLES = (
     EnforcementRecord.__table__,
     Snapshot.__table__,
     RestoreJob.__table__,
-    AuditCursor.__table__,
     CommandAudit.__table__,
     CooldownRecord.__table__,
 )
