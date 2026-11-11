@@ -144,6 +144,7 @@ the Discord API, it is listed as unsupported rather than silently omitted.
 | Driverless `postgresql://` DSN and discrete `POSTGRES_*` form | yes | A | one DSN spelling shared with the rest of the NFPD stack |
 | TLS required for routable hosts only, with `DB_REQUIRE_TLS` override | yes | A | a single-label container name is not treated as remote |
 | Server-side authority ladder | yes | A | owner > delegate > operator > none |
+| `OPERATOR_FULL_AUTHORITY`: operator runs owner-only commands in every guild | yes | A | off by default; command authority only, never detection exemption; for a single-owner self-hosted bot |
 | Command auditing of allowed and denied attempts | yes | A | |
 | Health check (intents, permissions, hierarchy, database, audit log) | yes | A | |
 | Incident export | yes | A | metadata only |

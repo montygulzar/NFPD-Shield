@@ -290,6 +290,11 @@ invocation and written to `command_audit`.
 Authority ladder: **owner** (the Discord guild owner — final authority) >
 **delegate** (explicitly granted the `manage_shield` trust scope) >
 **operator** (global `OWNERID`, diagnostics only) > nobody else.
+Setting `OPERATOR_FULL_AUTHORITY=true` promotes the operator to owner authority
+in every guild — for a single-owner self-hosted bot where the operator is the
+person in charge. It is off by default, grants command authority only (never
+detection exemption, so a nuke from the operator account is still caught), and
+removes the last backstop if that account is compromised.
 Administrator and Manage Guild grant **no** Shield authority, because those are
 exactly the permissions a compromised-admin attack abuses.
 
