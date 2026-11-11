@@ -62,6 +62,13 @@ REQUIRE_DELEGATE = Authority.DELEGATE
 REQUIRE_OPERATOR = Authority.OPERATOR
 
 
+def _is_guild_owner(interaction: discord.Interaction) -> bool:
+    guild = interaction.guild
+    return guild is not None and int(getattr(guild, "owner_id", 0) or 0) == int(
+        interaction.user.id
+    )
+
+
 async def resolve_authority(interaction: discord.Interaction) -> Authority:
     """Determine the caller's authority for *this* guild."""
     guild = interaction.guild
@@ -92,6 +99,10 @@ async def resolve_authority(interaction: discord.Interaction) -> Authority:
 
     config = getattr(bot, "shield_config", None)
     if config is not None and config.is_operator(int(user.id)):
+        # With OPERATOR_FULL_AUTHORITY the operator acts with owner authority in
+        # every guild. Off (the default) they keep diagnostics-only scope.
+        if getattr(config, "operator_full_authority", False):
+            return Authority.OWNER
         return Authority.OPERATOR
     return Authority.NONE
 
@@ -131,7 +142,9 @@ async def authorize(
     if allowed and authority is Authority.OPERATOR and required > Authority.OPERATOR:
         allowed = False
 
-    if allowed:
+    if allowed and authority is Authority.OWNER and not _is_guild_owner(interaction):
+        reason = "authorized as bot operator (OPERATOR_FULL_AUTHORITY)"
+    elif allowed:
         reason = f"authorized as {authority.name.lower()}"
     elif authority is Authority.OPERATOR:
         reason = (

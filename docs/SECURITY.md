@@ -21,7 +21,7 @@
 | Replay resistance | restore approval tokens are random 48-bit hex, guild-scoped, single-use, short-lived, and compared with `secrets.compare_digest` |
 | Idempotency | every automated response claims a unique `idempotency_key` row before any Discord call |
 | Abuse resistance | per-guild token buckets, durable cooldowns, escalation instead of repetition, hard write caps, bounded message deletion |
-| Fail-safe defaults | a new guild is created disabled, `alert_only`, `dry_run=true`; enforcement responses require confirmed attribution |
+| Fail-safe defaults | a new guild is created disabled, `alert_only`, `dry_run=true`; enforcement responses require confirmed attribution; `OPERATOR_FULL_AUTHORITY` is off, so the operator cannot change protection state unless deliberately enabled |
 | Fail-loud configuration | boot lists every invalid variable and exits 78 without connecting |
 
 ## 2. Threat-specific review notes
@@ -80,6 +80,7 @@ and install with `--require-hashes`.
 | Snapshots are unencrypted without a key | a database dump reveals guild structure | `SNAPSHOT_ENCRYPTION_KEY` is prominently recommended; `/shield backup create` warns when it is unset. |
 | Losing the snapshot key loses the snapshots | restore becomes impossible | the failure is explicit and actionable, never silent. Back the key up separately from the database. |
 | `RUN_MIGRATIONS_ON_BOOT=true` with several instances can race | duplicate DDL attempts | defaults to false in the shipped environment file; migrate from the deploy step. |
+| `OPERATOR_FULL_AUTHORITY` lets the operator override every guild owner | if the operator account is compromised, the attacker can disable Shield everywhere, then nuke | off by default and documented as removing the last backstop; it grants command authority only, never detection exemption, so a nuke from the operator account is still caught; intended for a single-owner self-hosted bot where the operator is the human in charge |
 | No Prometheus endpoint | metrics are only visible through `/shield metrics` and logs | counters are JSON-serialisable; wiring an exporter is a small addition (roadmap phase 7). |
 
 ## 4. Pre-deployment checklist

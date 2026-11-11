@@ -279,6 +279,14 @@ class ShieldConfig:
     default_mode: ShieldMode
     global_dry_run: bool
 
+    #: When true, the global bot operator(s) can run the owner-only commands
+    #: (enable/disable, mode, pause/resume, restore apply, lockdown) in every
+    #: guild - overriding the Discord guild owner. OFF by default: it removes the
+    #: last backstop if an operator account is compromised. For a single-owner
+    #: self-hosted deployment where the operator IS the human in charge, it is
+    #: the switch that lets them act when a guild owner is unavailable.
+    operator_full_authority: bool
+
     snapshot_interval_minutes: int
     snapshot_retention: int
     snapshot_encryption_key: str | None
@@ -346,6 +354,7 @@ class ShieldConfig:
             "enable_guild_members": self.enable_guild_members,
             "default_mode": self.default_mode.value,
             "global_dry_run": self.global_dry_run,
+            "operator_full_authority": self.operator_full_authority,
             "snapshot_interval_minutes": self.snapshot_interval_minutes,
             "snapshot_retention": self.snapshot_retention,
             "snapshot_encryption": bool(self.snapshot_encryption_key),
@@ -638,6 +647,7 @@ def load_config(env: Env | None = None, *, allow_dotenv: bool | None = None) -> 
     )
     default_mode = ShieldMode(mode_value)
     global_dry_run = col.boolean("GLOBAL_DRY_RUN", False)
+    operator_full_authority = col.boolean("OPERATOR_FULL_AUTHORITY", False)
 
     if default_mode is ShieldMode.LOCKDOWN:
         col.fail(
@@ -715,6 +725,7 @@ def load_config(env: Env | None = None, *, allow_dotenv: bool | None = None) -> 
         enable_guild_members=enable_guild_members,
         default_mode=default_mode,
         global_dry_run=global_dry_run,
+        operator_full_authority=operator_full_authority,
         snapshot_interval_minutes=snapshot_interval,
         snapshot_retention=snapshot_retention,
         snapshot_encryption_key=_validate_encryption_key(col),
@@ -742,6 +753,13 @@ def load_config(env: Env | None = None, *, allow_dotenv: bool | None = None) -> 
         run_migrations_on_boot=col.boolean("RUN_MIGRATIONS_ON_BOOT", True),
         operator_ids=frozenset({owner_id, *extra_ops}) - {0},
     )
+
+    if operator_full_authority and not config.operator_ids:
+        col.fail(
+            "OPERATOR_FULL_AUTHORITY=true but no operator is configured. Set "
+            "OWNERID (or OWNER_IDS) to the account that should hold owner-level "
+            "authority, or leave OPERATOR_FULL_AUTHORITY unset."
+        )
 
     if col.errors:
         raise ConfigError(col.errors)
